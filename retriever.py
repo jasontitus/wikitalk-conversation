@@ -7,6 +7,7 @@ import pickle
 import faiss
 import numpy as np
 import logging
+import torch
 from typing import List, Dict, Any, Tuple, Optional
 from sentence_transformers import SentenceTransformer
 from rapidfuzz import fuzz
@@ -16,6 +17,20 @@ import time
 from config import *
 
 logger = logging.getLogger(__name__)
+
+# Detect and set device for GPU acceleration
+def get_device():
+    """Get the best available device for inference"""
+    if torch.cuda.is_available():
+        device = "cuda"
+        logger.info(f"✓ GPU detected: {torch.cuda.get_device_name(0)}")
+        logger.info(f"  CUDA available: True")
+    else:
+        device = "cpu"
+        logger.warning("⚠ GPU not detected, using CPU (slower)")
+    return device
+
+DEVICE = get_device()
 
 
 class HybridRetriever:
@@ -28,7 +43,7 @@ class HybridRetriever:
         """
         self.use_bm25_only = use_bm25_only
         self.build_embeddings = build_embeddings
-        self.embedding_model = SentenceTransformer(EMBEDDING_MODEL) if not use_bm25_only else None
+        self.embedding_model = SentenceTransformer(EMBEDDING_MODEL, device=DEVICE) if not use_bm25_only else None
         self.faiss_index = None
         self.id_mapping = {}
         self.conn = None
@@ -87,8 +102,9 @@ class HybridRetriever:
         logger.info("🚀 Building embedding index from database (streaming)...")
         logger.info("   This will take 1-2 hours for 33.5M chunks")
         
-        embedding_batch_size = 512  # Process embeddings in batches
-        db_batch_size = 5000  # Read from database in chunks
+        # Optimized batch sizes for better GPU/CPU utilization
+        embedding_batch_size = 1024  # Increased from 512 to maximize GPU
+        db_batch_size = 10000  # Increased from 5000 to reduce I/O overhead
         
         try:
             import psutil
@@ -101,8 +117,12 @@ class HybridRetriever:
             total_chunks = cursor.fetchone()[0]
             logger.info(f"   Total chunks to process: {total_chunks:,}")
             
-            # Initialize FAISS index
-            self.faiss_index = faiss.IndexFlatL2(EMBEDDING_DIM)
+            # Initialize FAISS index using IVFFlat (more efficient for large datasets)
+            # IVFFlat partitions the space into buckets, avoiding slowdown as index grows
+            logger.info("   Creating FAISS IVFFlat index (optimized for large datasets)...")
+            nlist = 1000  # Number of partitions (buckets)
+            quantizer = faiss.IndexFlatL2(EMBEDDING_DIM)
+            self.faiss_index = faiss.IndexIVFFlat(quantizer, EMBEDDING_DIM, nlist)
             self.id_mapping = {}
             vector_index = 0
             
@@ -111,6 +131,26 @@ class HybridRetriever:
             last_progress_time = build_start_time
             last_progress_chunks = 0
             process = psutil.Process()
+            
+            # IMPORTANT: IVFFlat needs training on sample data before adding vectors
+            logger.info("   Training index on sample data...")
+            train_samples = []
+            cursor.execute("SELECT text, title FROM chunks LIMIT 40000")
+            for row in cursor.fetchall():
+                texts = [f"{row[1]}: {row[0][:500]}"]
+                embeddings = self.embedding_model.encode(
+                    texts,
+                    batch_size=64,
+                    show_progress_bar=False,
+                    convert_to_numpy=True
+                )
+                train_samples.append(embeddings[0])
+            
+            if train_samples:
+                train_data = np.array(train_samples, dtype='float32')
+                faiss.normalize_L2(train_data)
+                self.faiss_index.train(train_data)
+                logger.info(f"   ✓ Index trained on {len(train_samples)} samples")
             
             # Process in streaming batches
             processed = 0
@@ -128,17 +168,17 @@ class HybridRetriever:
                 if not chunk_batch:
                     break
                 
-                # Process embeddings in sub-batches
+                # Process embeddings in sub-batches (larger for better GPU utilization)
                 for i in range(0, len(chunk_batch), embedding_batch_size):
                     sub_batch = chunk_batch[i:i+embedding_batch_size]
                     
                     # Create texts for embedding (combine title and text for context)
                     texts = [f"{row[2]}: {row[1][:500]}" for row in sub_batch]
                     
-                    # Generate embeddings
+                    # Generate embeddings with larger batch for GPU efficiency
                     embeddings = self.embedding_model.encode(
                         texts,
-                        batch_size=64,
+                        batch_size=256,  # Increased from 64 to better utilize GPU
                         show_progress_bar=False,
                         convert_to_numpy=True
                     )
@@ -214,6 +254,8 @@ class HybridRetriever:
             
         except Exception as e:
             logger.error(f"Failed to build embedding index: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             self.use_bm25_only = True
     
     def embedding_search(self, query: str, top_k: int = RETRIEVAL_TOPK) -> List[Dict[str, Any]]:
