@@ -13,12 +13,19 @@ from config import *
 
 
 class WikiTalk:
-    def __init__(self):
-        self.retriever = HybridRetriever()
+    def __init__(self, use_embeddings=True):
+        """Initialize WikiTalk
+        
+        Args:
+            use_embeddings: If True, use semantic search; if False, use keyword search
+        """
+        # Initialize with embedding search by default (if available)
+        self.retriever = HybridRetriever(use_bm25_only=not use_embeddings)
         self.llm_client = LLMClient()
         self.tts_client = TTSClient()
         self.conversation_manager = ConversationManager()
         self.session_id = str(uuid.uuid4())
+        self.use_embeddings = use_embeddings
         
     def initialize(self):
         """Initialize all components"""
@@ -26,7 +33,10 @@ class WikiTalk:
         
         try:
             self.retriever.load_indexes()
-            print("✓ Retrieval system loaded")
+            if self.use_embeddings and self.retriever.faiss_index is not None:
+                print("✓ Retrieval system loaded (using semantic search)")
+            else:
+                print("✓ Retrieval system loaded (using keyword search)")
         except Exception as e:
             print(f"✗ Failed to load retrieval system: {e}")
             return False
@@ -44,7 +54,7 @@ class WikiTalk:
         return True
     
     def process_query(self, query: str, use_tts: bool = True) -> Dict[str, Any]:
-        """Process a user query and return response"""
+        
         start_time = time.time()
         
         # Load conversation history
@@ -56,9 +66,10 @@ class WikiTalk:
         print(f"Original query: {query}")
         print(f"Rewritten query: {rewritten_query}")
         
-        # Retrieve relevant sources
+        # Retrieve relevant sources using appropriate search method
         print("Searching Wikipedia...")
-        sources = self.retriever.hybrid_search(rewritten_query, top_k=5)
+        search_method = "embedding" if (self.use_embeddings and self.retriever.faiss_index) else "like"
+        sources = self.retriever.search(rewritten_query, top_k=5, method=search_method)
         
         if not sources:
             response = "I couldn't find relevant information about that topic in my Wikipedia database."
@@ -87,7 +98,8 @@ class WikiTalk:
             "response": response,
             "sources": sources[:3],  # Top 3 sources
             "processing_time": processing_time,
-            "session_id": self.session_id
+            "session_id": self.session_id,
+            "search_method": search_method
         }
     
     def get_conversation_history(self) -> List[Dict[str, str]]:

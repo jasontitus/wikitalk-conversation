@@ -1,12 +1,13 @@
 """
 Hybrid retrieval system for WikiTalk - Optimized for Large Database
+Now with efficient embedding search using streaming
 """
 import sqlite3
 import pickle
 import faiss
 import numpy as np
 import logging
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from sentence_transformers import SentenceTransformer
 from rapidfuzz import fuzz
 import json
@@ -18,17 +19,20 @@ logger = logging.getLogger(__name__)
 
 
 class HybridRetriever:
-    def __init__(self, use_bm25_only=True):
-        """Initialize retriever - optimized for large databases
+    def __init__(self, use_bm25_only=False, build_embeddings=False):
+        """Initialize retriever
         
         Args:
-            use_bm25_only: If True, use only BM25 search (recommended for large DB)
+            use_bm25_only: If True, use only LIKE search (fast fallback)
+            build_embeddings: If True, build embedding index from scratch
         """
         self.use_bm25_only = use_bm25_only
-        self.embedding_model = None if use_bm25_only else SentenceTransformer(EMBEDDING_MODEL)
+        self.build_embeddings = build_embeddings
+        self.embedding_model = SentenceTransformer(EMBEDDING_MODEL) if not use_bm25_only else None
         self.faiss_index = None
         self.id_mapping = {}
         self.conn = None
+        self.article_embeddings = {}  # Cache of article embeddings
         
         # Connection pool for better performance
         self._init_db_connection()
@@ -37,13 +41,13 @@ class HybridRetriever:
         """Initialize database connection with optimizations"""
         try:
             self.conn = sqlite3.connect(str(SQLITE_DB_PATH), timeout=30)
-            self.conn.row_factory = sqlite3.Row  # Return dict-like rows
+            self.conn.row_factory = sqlite3.Row
             
             # Enable query optimizations
-            self.conn.execute("PRAGMA journal_mode=WAL")  # Write-ahead logging for better concurrency
-            self.conn.execute("PRAGMA synchronous=NORMAL")  # Faster I/O
-            self.conn.execute("PRAGMA cache_size=10000")  # Larger cache
-            self.conn.execute("PRAGMA query_only=true")  # Read-only mode for safety
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+            self.conn.execute("PRAGMA cache_size=10000")
+            self.conn.execute("PRAGMA query_only=true")
             
             logger.info("Database connection initialized with optimizations")
         except Exception as e:
@@ -55,44 +59,179 @@ class HybridRetriever:
         logger.info("Loading retrieval indexes...")
         
         if self.use_bm25_only:
-            logger.info("Using BM25 search only (optimized for large database)")
-            # Verify SQLite has FTS5 index
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='chunks_fts'")
-            if not cursor.fetchone():
-                logger.warning("FTS5 index not found. Full-text search may be slow.")
-            logger.info("Indexes loaded successfully")
+            logger.info("Using LIKE search only (fast fallback)")
             return
         
-        # Load FAISS index if hybrid search is enabled
-        try:
-            if FAISS_INDEX_PATH.exists():
-                logger.info("Loading FAISS index...")
+        # Try to load existing FAISS index
+        if FAISS_INDEX_PATH.exists() and not self.build_embeddings:
+            try:
+                logger.info("Loading existing FAISS index...")
                 self.faiss_index = faiss.read_index(str(FAISS_INDEX_PATH))
                 with open(IDS_MAPPING_PATH, 'rb') as f:
                     self.id_mapping = pickle.load(f)
-                logger.info(f"FAISS index loaded with {len(self.id_mapping)} vectors")
-            else:
-                logger.warning("FAISS index not found. Using BM25 only.")
-                self.use_bm25_only = True
-        except Exception as e:
-            logger.warning(f"Failed to load FAISS: {e}. Using BM25 only.")
-            self.use_bm25_only = True
+                logger.info(f"✓ FAISS index loaded with {len(self.id_mapping)} vectors")
+            except Exception as e:
+                logger.warning(f"Failed to load FAISS index: {e}. Will rebuild.")
+                self.build_embeddings = True
+        else:
+            self.build_embeddings = True
+        
+        # Build embeddings if needed
+        if self.build_embeddings:
+            self._build_embedding_index_streaming()
         
         logger.info("Indexes loaded successfully")
     
+    def _build_embedding_index_streaming(self):
+        """Build FAISS index by streaming chunks from database in batches"""
+        logger.info("🚀 Building embedding index from database (streaming)...")
+        logger.info("   This will take 1-2 hours for 33.5M chunks")
+        
+        embedding_batch_size = 512  # Process embeddings in batches
+        db_batch_size = 5000  # Read from database in chunks
+        
+        try:
+            cursor = self.conn.cursor()
+            
+            # Get total count
+            cursor.execute("SELECT COUNT(*) FROM chunks")
+            total_chunks = cursor.fetchone()[0]
+            logger.info(f"   Total chunks to process: {total_chunks:,}")
+            
+            # Initialize FAISS index
+            self.faiss_index = faiss.IndexFlatL2(EMBEDDING_DIM)
+            self.id_mapping = {}
+            vector_index = 0
+            
+            # Process in streaming batches
+            processed = 0
+            while processed < total_chunks:
+                # Read batch of chunks from database
+                cursor.execute("""
+                    SELECT id, text, title
+                    FROM chunks
+                    LIMIT ? OFFSET ?
+                """, (db_batch_size, processed))
+                
+                chunk_batch = cursor.fetchall()
+                if not chunk_batch:
+                    break
+                
+                # Process embeddings in sub-batches
+                for i in range(0, len(chunk_batch), embedding_batch_size):
+                    sub_batch = chunk_batch[i:i+embedding_batch_size]
+                    
+                    # Create texts for embedding (combine title and text for context)
+                    texts = [f"{row[2]}: {row[1][:500]}" for row in sub_batch]
+                    
+                    # Generate embeddings
+                    embeddings = self.embedding_model.encode(
+                        texts,
+                        batch_size=64,
+                        show_progress_bar=False,
+                        convert_to_numpy=True
+                    )
+                    
+                    embeddings = embeddings.astype('float32')
+                    faiss.normalize_L2(embeddings)
+                    
+                    # Add to FAISS index
+                    self.faiss_index.add(embeddings)
+                    
+                    # Store ID mapping
+                    for j, row in enumerate(sub_batch):
+                        self.id_mapping[vector_index + j] = row[0]
+                    
+                    vector_index += len(sub_batch)
+                
+                processed += len(chunk_batch)
+                
+                if processed % 50000 == 0:
+                    logger.info(f"   ✓ Processed {processed:,}/{total_chunks:,} chunks")
+            
+            # Save index
+            faiss.write_index(self.faiss_index, str(FAISS_INDEX_PATH))
+            with open(IDS_MAPPING_PATH, 'wb') as f:
+                pickle.dump(self.id_mapping, f)
+            
+            logger.info(f"✅ Embedding index created: {len(self.id_mapping):,} vectors")
+            
+        except Exception as e:
+            logger.error(f"Failed to build embedding index: {e}")
+            self.use_bm25_only = True
+    
+    def embedding_search(self, query: str, top_k: int = RETRIEVAL_TOPK) -> List[Dict[str, Any]]:
+        """Search using embeddings - best for semantic queries"""
+        if self.faiss_index is None or self.use_bm25_only:
+            logger.warning("Embedding search not available, falling back to LIKE search")
+            return self.bm25_search(query, top_k)
+        
+        try:
+            start_time = time.time()
+            
+            # Generate query embedding
+            query_embedding = self.embedding_model.encode([query], convert_to_numpy=True)
+            query_embedding = query_embedding.astype('float32')
+            faiss.normalize_L2(query_embedding)
+            
+            # Search FAISS index
+            scores, indices = self.faiss_index.search(query_embedding, top_k * 3)
+            
+            results = []
+            cursor = self.conn.cursor()
+            
+            for score, idx in zip(scores[0], indices[0]):
+                if idx == -1:  # Invalid index
+                    continue
+                
+                chunk_id = self.id_mapping.get(idx)
+                if not chunk_id:
+                    continue
+                
+                # Get full metadata
+                cursor.execute("""
+                    SELECT id, text, title, page_id, url, date_modified,
+                           wikidata_id, infoboxes, has_math, start_pos, end_pos
+                    FROM chunks WHERE id = ?
+                """, (chunk_id,))
+                
+                row = cursor.fetchone()
+                if row:
+                    results.append({
+                        'id': row[0],
+                        'text': row[1],
+                        'title': row[2],
+                        'page_id': row[3],
+                        'url': row[4],
+                        'date_modified': row[5],
+                        'wikidata_id': row[6],
+                        'infoboxes': row[7],
+                        'has_math': row[8],
+                        'start_pos': row[9],
+                        'end_pos': row[10],
+                        'score': float(1 / (1 + score))  # Convert distance to similarity
+                    })
+            
+            elapsed = time.time() - start_time
+            logger.info(f"Embedding search completed in {elapsed:.2f}s, found {len(results)} results")
+            
+            return results
+        
+        except Exception as e:
+            logger.error(f"Embedding search failed: {e}")
+            return self.bm25_search(query, top_k)
+    
     def bm25_search(self, query: str, top_k: int = RETRIEVAL_TOPK) -> List[Dict[str, Any]]:
-        """Fast search using simple SQL LIKE - More reliable than FTS5 on very large databases"""
+        """Fast search using simple SQL LIKE - Fallback method"""
         start_time = time.time()
         
         try:
             cursor = self.conn.cursor()
             
-            # Use simple LIKE search instead of FTS5 - much faster on large datasets
-            # Split query into keywords for better matching
+            # Use simple LIKE search - fast fallback
             keywords = query.lower().split()
             
-            # Build WHERE clause with multiple LIKE conditions
+            # Build WHERE clause
             where_conditions = []
             params = []
             
@@ -102,7 +241,6 @@ class HybridRetriever:
             
             where_clause = " AND ".join(where_conditions) if where_conditions else "1=1"
             
-            # Query with simple LIKE - much faster than FTS5 on huge datasets
             sql = f"""
                 SELECT 
                     id, text, title, page_id, url, date_modified,
@@ -112,16 +250,16 @@ class HybridRetriever:
                 LIMIT ?
             """
             
-            params.append(top_k * 5)  # Get extra for reranking
+            params.append(top_k * 5)
             
             cursor.execute(sql, params)
             
             results = []
             for row in cursor.fetchall():
-                # Calculate simple relevance score based on keyword matches
+                # Calculate relevance score
                 title_matches = sum(1 for kw in keywords if kw in row[2].lower())
                 text_matches = sum(1 for kw in keywords if kw in row[1].lower())
-                score = (title_matches * 2 + text_matches) / (len(keywords) * 3)  # Normalize to ~0-1
+                score = (title_matches * 2 + text_matches) / (len(keywords) * 3)
                 
                 results.append({
                     'id': row[0],
@@ -149,57 +287,28 @@ class HybridRetriever:
             logger.error(f"Search failed: {e}")
             return []
     
-    def dense_search(self, query: str, top_k: int = RETRIEVAL_TOPK) -> List[Dict[str, Any]]:
-        """Dense vector search using FAISS - Only if available"""
-        if self.faiss_index is None or self.use_bm25_only:
-            return []
+    def search(self, query: str, top_k: int = 20, method: str = "embedding") -> List[Dict[str, Any]]:
+        """Unified search method
         
-        try:
-            # Generate query embedding
-            query_embedding = self.embedding_model.encode([query])
-            query_embedding = query_embedding.astype('float32')
-            faiss.normalize_L2(query_embedding)
-            
-            # Search FAISS index
-            scores, indices = self.faiss_index.search(query_embedding, top_k)
-            
-            results = []
-            cursor = self.conn.cursor()
-            
-            for score, idx in zip(scores[0], indices[0]):
-                if idx == -1:  # Invalid index
-                    continue
-                    
-                chunk_id = self.id_mapping[idx]
-                
-                # Get full metadata from SQLite
-                cursor.execute("""
-                    SELECT id, text, title, page_id, url, date_modified,
-                           wikidata_id, infoboxes, has_math, start_pos, end_pos
-                    FROM chunks WHERE id = ?
-                """, (chunk_id,))
-                
-                row = cursor.fetchone()
-                if row:
-                    results.append({
-                        'id': row[0],
-                        'text': row[1],
-                        'title': row[2],
-                        'page_id': row[3],
-                        'url': row[4],
-                        'date_modified': row[5],
-                        'wikidata_id': row[6],
-                        'infoboxes': row[7],
-                        'has_math': row[8],
-                        'start_pos': row[9],
-                        'end_pos': row[10],
-                        'score': float(score)
-                    })
-            
-            return results
-        except Exception as e:
-            logger.warning(f"Dense search failed, falling back to BM25: {e}")
-            return []
+        Args:
+            query: Search query
+            top_k: Number of results
+            method: "embedding" for semantic search, "like" for keyword search
+        """
+        start_time = time.time()
+        
+        if method == "embedding":
+            results = self.embedding_search(query, RETRIEVAL_TOPK)
+        else:
+            results = self.bm25_search(query, RETRIEVAL_TOPK)
+        
+        # Rerank top results
+        reranked_results = self.rerank_results(query, results, top_k)
+        
+        elapsed = time.time() - start_time
+        logger.info(f"Search completed in {elapsed:.2f}s: '{query}' → {len(reranked_results)} results")
+        
+        return reranked_results
     
     def rerank_results(self, query: str, results: List[Dict[str, Any]], top_k: int = 20) -> List[Dict[str, Any]]:
         """Rerank results using RapidFuzz"""
@@ -218,68 +327,6 @@ class HybridRetriever:
         # Sort by rerank score
         results.sort(key=lambda x: x['rerank_score'], reverse=True)
         return results[:top_k]
-    
-    def search(self, query: str, top_k: int = 20) -> List[Dict[str, Any]]:
-        """Unified search method - Uses best available method
-        
-        For large databases (33.5M chunks), BM25 is recommended
-        """
-        start_time = time.time()
-        
-        if self.use_bm25_only or self.faiss_index is None:
-            # BM25 only search
-            logger.debug(f"Using BM25 search for: {query}")
-            results = self.bm25_search(query, RETRIEVAL_TOPK)
-        else:
-            # Hybrid search
-            logger.debug(f"Using hybrid search for: {query}")
-            
-            # Get results from both methods
-            bm25_results = self.bm25_search(query, RETRIEVAL_TOPK)
-            dense_results = self.dense_search(query, RETRIEVAL_TOPK)
-            
-            # Combine and deduplicate
-            all_results = {}
-            
-            # Add BM25 results
-            for result in bm25_results:
-                chunk_id = result['id']
-                if chunk_id not in all_results:
-                    all_results[chunk_id] = result
-                    all_results[chunk_id]['bm25_score'] = result['score']
-                    all_results[chunk_id]['dense_score'] = 0.0
-                else:
-                    all_results[chunk_id]['bm25_score'] = result['score']
-            
-            # Add dense results
-            for result in dense_results:
-                chunk_id = result['id']
-                if chunk_id not in all_results:
-                    all_results[chunk_id] = result
-                    all_results[chunk_id]['bm25_score'] = 0.0
-                    all_results[chunk_id]['dense_score'] = result['score']
-                else:
-                    all_results[chunk_id]['dense_score'] = result['score']
-            
-            # Combine scores
-            combined_results = []
-            for result in all_results.values():
-                bm25_score = result.get('bm25_score', 0)
-                dense_score = result.get('dense_score', 0)
-                result['combined_score'] = 0.6 * dense_score + 0.4 * bm25_score
-                combined_results.append(result)
-            
-            # Sort by combined score
-            combined_results.sort(key=lambda x: x['combined_score'], reverse=True)
-            results = combined_results[:top_k * 2]
-        
-        # Rerank top results
-        reranked_results = self.rerank_results(query, results, top_k)
-        
-        elapsed = time.time() - start_time
-        logger.info(f"Search completed in {elapsed:.2f}s: '{query}' → {len(reranked_results)} results")
-        
-        return reranked_results
     
     def format_sources(self, results: List[Dict[str, Any]]) -> str:
         """Format results as source citations"""
@@ -301,21 +348,21 @@ class HybridRetriever:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     
-    logger.info("Testing HybridRetriever with large database")
+    logger.info("Testing HybridRetriever with embedding search")
     
-    # Initialize with BM25-only mode for large database
-    retriever = HybridRetriever(use_bm25_only=True)
+    # Initialize with embedding search (will build index on first run)
+    retriever = HybridRetriever(use_bm25_only=False, build_embeddings=False)
     retriever.load_indexes()
     
     # Test search
     test_queries = [
-        "World War I causes",
-        "machine learning algorithms",
-        "ancient Rome history"
+        "ancient roman architecture",
+        "quantum physics research",
+        "renaissance art and culture"
     ]
     
     for query in test_queries:
-        results = retriever.search(query, top_k=3)
+        results = retriever.search(query, top_k=3, method="embedding")
         
         logger.info(f"\nSearch results for: '{query}'")
         for i, result in enumerate(results, 1):
