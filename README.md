@@ -1,5 +1,7 @@
 # WikiTalk: Local Conversational Historian
 
+<IN DEVELOPMENT - NOT CURRENTLY WORKING>
+
 WikiTalk is an offline, conversational AI assistant that allows users to talk about history, science, and culture using a local copy of Wikipedia. It understands natural questions, supports follow-up questions and contextual discussion, and speaks answers aloud via Piper TTS.
 
 ## Features
