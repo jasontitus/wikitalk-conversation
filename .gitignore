@@ -1,0 +1,63 @@
+# Virtual environments
+venv/
+clean_venv/
+env/
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Large data files
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.parquet
+faiss.index
+ids.bin
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+*.pem
+
+# Temporary files
+test_output.txt
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Data directories (but track their structure)
+data/conversations/*.json
+!data/.gitkeep
+!data/conversations/.gitkeep
+
+# Model caches
+.cache/
