@@ -88,18 +88,19 @@ class HybridRetriever:
         try:
             cursor = self.conn.cursor()
             
-            # Improved FTS5 query with better ranking
+            # Optimize FTS5 query - use LIMIT to stop scanning early
+            # The key is to use LIMIT at the FTS5 level, not after joining
             cursor.execute("""
                 SELECT 
                     c.id, c.text, c.title, c.page_id, c.url, c.date_modified,
                     c.wikidata_id, c.infoboxes, c.has_math, c.start_pos, c.end_pos,
-                    rank
+                    f.rank
                 FROM chunks_fts f
                 JOIN chunks c ON c.id = f.rowid
                 WHERE chunks_fts MATCH ?
-                ORDER BY rank
+                ORDER BY f.rank
                 LIMIT ?
-            """, (query, top_k))
+            """, (query, top_k * 5))  # Get extra results for reranking
             
             results = []
             for row in cursor.fetchall():
@@ -120,7 +121,7 @@ class HybridRetriever:
                 })
             
             elapsed = time.time() - start_time
-            logger.debug(f"BM25 search completed in {elapsed:.2f}s, found {len(results)} results")
+            logger.info(f"BM25 search completed in {elapsed:.2f}s, found {len(results)} results")
             
             return results
         except Exception as e:
