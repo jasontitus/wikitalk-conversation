@@ -91,6 +91,9 @@ class HybridRetriever:
         db_batch_size = 5000  # Read from database in chunks
         
         try:
+            import psutil
+            import time as time_module
+            
             cursor = self.conn.cursor()
             
             # Get total count
@@ -103,9 +106,17 @@ class HybridRetriever:
             self.id_mapping = {}
             vector_index = 0
             
+            # Track timing and memory
+            build_start_time = time_module.time()
+            last_progress_time = build_start_time
+            last_progress_chunks = 0
+            process = psutil.Process()
+            
             # Process in streaming batches
             processed = 0
             while processed < total_chunks:
+                batch_start_time = time_module.time()
+                
                 # Read batch of chunks from database
                 cursor.execute("""
                     SELECT id, text, title
@@ -145,16 +156,61 @@ class HybridRetriever:
                     vector_index += len(sub_batch)
                 
                 processed += len(chunk_batch)
+                current_time = time_module.time()
                 
-                if processed % 50000 == 0:
-                    logger.info(f"   ✓ Processed {processed:,}/{total_chunks:,} chunks")
+                # Log progress every 100K chunks or every 30 seconds
+                if processed % 100000 == 0 or (current_time - last_progress_time) > 30:
+                    elapsed = current_time - build_start_time
+                    chunks_in_period = processed - last_progress_chunks
+                    time_in_period = current_time - last_progress_time
+                    
+                    if time_in_period > 0:
+                        chunks_per_sec = chunks_in_period / time_in_period
+                        remaining_chunks = total_chunks - processed
+                        eta_seconds = remaining_chunks / chunks_per_sec if chunks_per_sec > 0 else 0
+                        eta_minutes = eta_seconds / 60
+                        eta_hours = eta_minutes / 60
+                    else:
+                        chunks_per_sec = 0
+                        eta_hours = 0
+                    
+                    # Get memory info
+                    mem_info = process.memory_info()
+                    mem_mb = mem_info.rss / (1024 * 1024)
+                    percent_done = (processed / total_chunks) * 100
+                    percent_ram = (mem_mb / (128 * 1024)) * 100  # Assuming 128GB system
+                    
+                    elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m {int(elapsed % 60)}s"
+                    
+                    logger.info(f"")
+                    logger.info(f"   ✓ Processed {processed:,}/{total_chunks:,} chunks ({percent_done:.1f}%)")
+                    logger.info(f"     Time elapsed: {elapsed_str}")
+                    logger.info(f"     Speed: {chunks_per_sec:.0f} chunks/sec")
+                    logger.info(f"     Memory: {mem_mb:,.0f} MB ({percent_ram:.1f}% of 128GB)")
+                    
+                    if eta_hours > 0:
+                        if eta_hours >= 1:
+                            logger.info(f"     ETA: ~{eta_hours:.1f} hours")
+                        else:
+                            logger.info(f"     ETA: ~{eta_minutes:.0f} minutes")
+                    
+                    last_progress_time = current_time
+                    last_progress_chunks = processed
             
             # Save index
             faiss.write_index(self.faiss_index, str(FAISS_INDEX_PATH))
             with open(IDS_MAPPING_PATH, 'wb') as f:
                 pickle.dump(self.id_mapping, f)
             
+            total_elapsed = time_module.time() - build_start_time
+            elapsed_str = f"{int(total_elapsed // 3600)}h {int((total_elapsed % 3600) // 60)}m {int(total_elapsed % 60)}s"
+            final_mem = process.memory_info().rss / (1024 * 1024)
+            
+            logger.info(f"")
             logger.info(f"✅ Embedding index created: {len(self.id_mapping):,} vectors")
+            logger.info(f"   Total time: {elapsed_str}")
+            logger.info(f"   Peak memory: {final_mem:,.0f} MB")
+            logger.info(f"")
             
         except Exception as e:
             logger.error(f"Failed to build embedding index: {e}")

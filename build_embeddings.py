@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 import time
 from datetime import timedelta
+import psutil
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -36,6 +37,12 @@ def main():
     db_size_gb = SQLITE_DB_PATH.stat().st_size / (1024 ** 3)
     logger.info(f"\n📊 Database: {db_size_gb:.1f} GB")
     
+    # System info
+    process = psutil.Process()
+    mem_total = psutil.virtual_memory().total / (1024 ** 3)
+    mem_available = psutil.virtual_memory().available / (1024 ** 3)
+    logger.info(f"💾 System RAM: {mem_total:.1f} GB total, {mem_available:.1f} GB available")
+    
     # Check if index already exists
     if FAISS_INDEX_PATH.exists():
         logger.info(f"✓ FAISS index already exists: {FAISS_INDEX_PATH}")
@@ -55,16 +62,31 @@ def main():
     
     logger.info("\n⏱️  Estimated time:")
     logger.info("   - GPU (NVIDIA): 1-2 hours")
-    logger.info("   - CPU: 4-6 hours")
-    logger.info("   - Mac CPU: 6-12 hours")
+    logger.info("   - GPU (M3 Max): 4-6 hours")
+    logger.info("   - CPU: 6-12 hours")
+    
+    logger.info("\n📊 Memory prediction:")
+    logger.info("   - Model load: ~2-3 GB")
+    logger.info("   - Index building: 10-20 MB per batch")
+    logger.info("   - Peak usage: ~30-50 GB (should be fine with 128GB)")
+    logger.info("   - Final index: ~15 GB")
     
     response = input("\n❓ Continue? (y/n): ").strip().lower()
     if response != 'y':
         logger.info("Cancelled")
         return False
     
+    # Monitor during build
+    logger.info("\n" + "=" * 70)
+    logger.info("📈 Build Progress Monitor")
+    logger.info("=" * 70)
+    logger.info("   Progress updates every 30 seconds or every 100K chunks")
+    logger.info("   Watch memory and ETA to estimate completion time")
+    logger.info("=" * 70 + "\n")
+    
     # Build index
     start_time = time.time()
+    start_mem = process.memory_info().rss / (1024 ** 3)
     
     try:
         retriever = HybridRetriever(use_bm25_only=False, build_embeddings=True)
@@ -73,11 +95,14 @@ def main():
         
         elapsed = time.time() - start_time
         elapsed_str = str(timedelta(seconds=int(elapsed)))
+        end_mem = process.memory_info().rss / (1024 ** 3)
+        peak_mem = end_mem  # Approximate peak
         
         logger.info("\n" + "=" * 70)
         logger.info("✅ Embedding index built successfully!")
         logger.info("=" * 70)
         logger.info(f"⏱️  Total time: {elapsed_str}")
+        logger.info(f"💾 Memory usage: {start_mem:.1f}GB → {end_mem:.1f}GB")
         logger.info(f"📁 Index saved to: {FAISS_INDEX_PATH}")
         logger.info(f"📊 Index size: {FAISS_INDEX_PATH.stat().st_size / (1024 ** 3):.1f} GB")
         
@@ -90,6 +115,7 @@ def main():
         
     except KeyboardInterrupt:
         logger.warning("\n⚠️  Build interrupted by user")
+        logger.warning("   You can resume by running the script again")
         return False
     except Exception as e:
         logger.error(f"\n❌ Build failed: {e}")
