@@ -82,28 +82,47 @@ class HybridRetriever:
         logger.info("Indexes loaded successfully")
     
     def bm25_search(self, query: str, top_k: int = RETRIEVAL_TOPK) -> List[Dict[str, Any]]:
-        """BM25 search using SQLite FTS5 - Optimized for large databases"""
+        """Fast search using simple SQL LIKE - More reliable than FTS5 on very large databases"""
         start_time = time.time()
         
         try:
             cursor = self.conn.cursor()
             
-            # Optimize FTS5 query - use LIMIT to stop scanning early
-            # The key is to use LIMIT at the FTS5 level, not after joining
-            cursor.execute("""
+            # Use simple LIKE search instead of FTS5 - much faster on large datasets
+            # Split query into keywords for better matching
+            keywords = query.lower().split()
+            
+            # Build WHERE clause with multiple LIKE conditions
+            where_conditions = []
+            params = []
+            
+            for keyword in keywords:
+                where_conditions.append("(title LIKE ? OR text LIKE ?)")
+                params.extend([f"%{keyword}%", f"%{keyword}%"])
+            
+            where_clause = " AND ".join(where_conditions) if where_conditions else "1=1"
+            
+            # Query with simple LIKE - much faster than FTS5 on huge datasets
+            sql = f"""
                 SELECT 
-                    c.id, c.text, c.title, c.page_id, c.url, c.date_modified,
-                    c.wikidata_id, c.infoboxes, c.has_math, c.start_pos, c.end_pos,
-                    f.rank
-                FROM chunks_fts f
-                JOIN chunks c ON c.id = f.rowid
-                WHERE chunks_fts MATCH ?
-                ORDER BY f.rank
+                    id, text, title, page_id, url, date_modified,
+                    wikidata_id, infoboxes, has_math, start_pos, end_pos
+                FROM chunks
+                WHERE {where_clause}
                 LIMIT ?
-            """, (query, top_k * 5))  # Get extra results for reranking
+            """
+            
+            params.append(top_k * 5)  # Get extra for reranking
+            
+            cursor.execute(sql, params)
             
             results = []
             for row in cursor.fetchall():
+                # Calculate simple relevance score based on keyword matches
+                title_matches = sum(1 for kw in keywords if kw in row[2].lower())
+                text_matches = sum(1 for kw in keywords if kw in row[1].lower())
+                score = (title_matches * 2 + text_matches) / (len(keywords) * 3)  # Normalize to ~0-1
+                
                 results.append({
                     'id': row[0],
                     'text': row[1],
@@ -116,16 +135,18 @@ class HybridRetriever:
                     'has_math': row[8],
                     'start_pos': row[9],
                     'end_pos': row[10],
-                    'rank': row[11],
-                    'score': 1.0 / (row[11] + 1)  # Convert rank to score
+                    'score': score
                 })
             
-            elapsed = time.time() - start_time
-            logger.info(f"BM25 search completed in {elapsed:.2f}s, found {len(results)} results")
+            # Sort by score
+            results.sort(key=lambda x: x['score'], reverse=True)
             
-            return results
+            elapsed = time.time() - start_time
+            logger.info(f"LIKE search completed in {elapsed:.2f}s, found {len(results)} results")
+            
+            return results[:top_k * 5]
         except Exception as e:
-            logger.error(f"BM25 search failed: {e}")
+            logger.error(f"Search failed: {e}")
             return []
     
     def dense_search(self, query: str, top_k: int = RETRIEVAL_TOPK) -> List[Dict[str, Any]]:

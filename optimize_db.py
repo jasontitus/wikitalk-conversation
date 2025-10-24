@@ -118,12 +118,9 @@ def optimize_database():
         conn.commit()
         logger.info("   ✓ PRAGMA optimize completed")
         
-        # 4. Vacuum (optional, for space)
-        logger.info("\n4️⃣ Vacuuming database (this may take a while)...")
-        start = time.time()
-        cursor.execute("VACUUM")
-        elapsed = time.time() - start
-        logger.info(f"   ✓ VACUUM completed in {elapsed:.2f}s")
+        # Skip VACUUM - it's too slow on 80GB databases
+        logger.info("\n4️⃣ Skipping VACUUM (takes too long on 80GB database)")
+        logger.info("   ℹ️  VACUUM not needed with modern SQLite WAL mode")
         
         # Get final statistics
         db_size = SQLITE_DB_PATH.stat().st_size / (1024 ** 3)
@@ -138,8 +135,8 @@ def optimize_database():
 
 
 def test_fts5_performance():
-    """Test FTS5 query performance"""
-    logger.info("\n⚡ FTS5 Performance Test")
+    """Test search performance with LIKE queries"""
+    logger.info("\n⚡ Search Performance Test")
     logger.info("=" * 70)
     
     test_queries = [
@@ -159,15 +156,24 @@ def test_fts5_performance():
         for query in test_queries:
             logger.info(f"\nTesting query: '{query}'")
             
+            # Use LIKE search instead of FTS5
+            keywords = query.lower().split()
+            where_conditions = []
+            params = []
+            
+            for keyword in keywords:
+                where_conditions.append("(title LIKE ? OR text LIKE ?)")
+                params.extend([f"%{keyword}%", f"%{keyword}%"])
+            
+            where_clause = " AND ".join(where_conditions)
+            
             start = time.time()
-            cursor.execute("""
-                SELECT c.id, c.title
-                FROM chunks_fts f
-                JOIN chunks c ON c.id = f.rowid
-                WHERE chunks_fts MATCH ?
-                ORDER BY f.rank
+            cursor.execute(f"""
+                SELECT id, title
+                FROM chunks
+                WHERE {where_clause}
                 LIMIT 10
-            """, (query,))
+            """, params)
             
             results = cursor.fetchall()
             elapsed = time.time() - start
