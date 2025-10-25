@@ -150,6 +150,8 @@ class HybridRetriever:
             last_progress_chunks = 0
             process = psutil.Process()
             
+            processed = 0
+            
             # Create worker pool
             with Pool(processes=num_workers) as pool:
                 # Queue up embedding jobs
