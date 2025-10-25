@@ -166,7 +166,7 @@ class HybridRetriever:
             
             # Create worker pool
             with Pool(processes=num_workers, initializer=_init_worker_process) as pool:
-                # Pre-warm worker pool - submit dummy jobs to trigger initialization
+                # Pre-warm worker pool
                 logger.info("   Pre-warming worker pool (initializing models in workers)...")
                 warmup_jobs = []
                 for i in range(num_workers):
@@ -182,38 +182,32 @@ class HybridRetriever:
                         pass
                 logger.info("   ✓ Worker pool initialized and ready")
                 
-                # Prepare all embedding jobs
-                logger.info("   Queuing all embedding jobs for parallel processing...")
-                all_jobs = []
+                # Generator function for streaming jobs without pre-loading
+                def job_generator():
+                    """Yield embedding jobs as needed (streaming, not pre-loaded)"""
+                    for offset in range(0, total_chunks, db_batch_size):
+                        cursor.execute("""
+                            SELECT id, text, title
+                            FROM chunks
+                            LIMIT ? OFFSET ?
+                        """, (db_batch_size, offset))
+                        
+                        chunk_batch = cursor.fetchall()
+                        if not chunk_batch:
+                            break
+                        
+                        chunk_ids = [row[0] for row in chunk_batch]
+                        texts = [f"{row[2]}: {row[1][:500]}" for row in chunk_batch]
+                        yield (chunk_ids, texts)
                 
-                cursor.execute("SELECT COUNT(*) FROM chunks")
-                total_chunks_check = cursor.fetchone()[0]
-                
-                # Pre-generate all job data
-                for offset in range(0, total_chunks_check, db_batch_size):
-                    cursor.execute("""
-                        SELECT id, text, title
-                        FROM chunks
-                        LIMIT ? OFFSET ?
-                    """, (db_batch_size, offset))
-                    
-                    chunk_batch = cursor.fetchall()
-                    if not chunk_batch:
-                        break
-                    
-                    chunk_ids = [row[0] for row in chunk_batch]
-                    texts = [f"{row[2]}: {row[1][:500]}" for row in chunk_batch]
-                    all_jobs.append((chunk_ids, texts))
-                
-                logger.info(f"   Queued {len(all_jobs)} embedding jobs")
-                
-                # Process with imap_unordered for true parallelism
+                # Process with imap for streaming parallelism
+                # imap maintains a buffer of ~num_workers*2 jobs
                 batch_index = 0
                 batch_vectors = []
                 batch_ids = []
                 vector_index = 0
                 
-                for chunk_ids, embeddings in pool.imap_unordered(_generate_embeddings_worker, all_jobs, chunksize=1):
+                for chunk_ids, embeddings in pool.imap_unordered(_generate_embeddings_worker, job_generator(), chunksize=1):
                     batch_vectors.append(embeddings)
                     batch_ids.extend(chunk_ids)
                     processed += len(chunk_ids)
