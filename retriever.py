@@ -74,10 +74,10 @@ class HybridRetriever:
         logger.info("Loading retrieval indexes...")
         
         if self.use_bm25_only:
-            logger.info("Using LIKE search only (fast fallback)")
+            logger.info("Using LIKE search only (keyword-based retrieval)")
             return
         
-        # Try to load existing FAISS index
+        # Try to load existing FAISS index if available
         if FAISS_INDEX_PATH.exists() and not self.build_embeddings:
             try:
                 logger.info("Loading existing FAISS index...")
@@ -100,11 +100,11 @@ class HybridRetriever:
     def _build_embedding_index_streaming(self):
         """Build FAISS index by streaming chunks from database in batches"""
         logger.info("🚀 Building embedding index from database (streaming)...")
-        logger.info("   This will take 1-2 hours for 33.5M chunks")
+        logger.info("   This will take 8-10 hours for 33.5M chunks")
         
-        # Optimized batch sizes for better GPU/CPU utilization
-        embedding_batch_size = 1024  # Increased from 512 to maximize GPU
-        db_batch_size = 10000  # Increased from 5000 to reduce I/O overhead
+        # Optimized batch sizes for safe operation
+        embedding_batch_size = 512  # Back to safer size
+        db_batch_size = 5000
         
         try:
             import psutil
@@ -117,14 +117,16 @@ class HybridRetriever:
             total_chunks = cursor.fetchone()[0]
             logger.info(f"   Total chunks to process: {total_chunks:,}")
             
-            # Initialize FAISS index using IVFFlat (more efficient for large datasets)
-            # IVFFlat partitions the space into buckets, avoiding slowdown as index grows
-            logger.info("   Creating FAISS IVFFlat index (optimized for large datasets)...")
-            nlist = 1000  # Number of partitions (buckets)
-            quantizer = faiss.IndexFlatL2(EMBEDDING_DIM)
-            self.faiss_index = faiss.IndexIVFFlat(quantizer, EMBEDDING_DIM, nlist)
+            # Initialize FAISS index - simple FlatL2 for reliability
+            logger.info("   Creating FAISS FlatL2 index...")
+            self.faiss_index = faiss.IndexFlatL2(EMBEDDING_DIM)
             self.id_mapping = {}
             vector_index = 0
+            
+            # Batch embeddings safely (collect before adding)
+            embedding_buffer = []
+            id_buffer = []
+            batch_insert_size = 100000  # Add 100K vectors at a time
             
             # Track timing and memory
             build_start_time = time_module.time()
@@ -132,31 +134,9 @@ class HybridRetriever:
             last_progress_chunks = 0
             process = psutil.Process()
             
-            # IMPORTANT: IVFFlat needs training on sample data before adding vectors
-            logger.info("   Training index on sample data...")
-            train_samples = []
-            cursor.execute("SELECT text, title FROM chunks LIMIT 40000")
-            for row in cursor.fetchall():
-                texts = [f"{row[1]}: {row[0][:500]}"]
-                embeddings = self.embedding_model.encode(
-                    texts,
-                    batch_size=64,
-                    show_progress_bar=False,
-                    convert_to_numpy=True
-                )
-                train_samples.append(embeddings[0])
-            
-            if train_samples:
-                train_data = np.array(train_samples, dtype='float32')
-                faiss.normalize_L2(train_data)
-                self.faiss_index.train(train_data)
-                logger.info(f"   ✓ Index trained on {len(train_samples)} samples")
-            
             # Process in streaming batches
             processed = 0
             while processed < total_chunks:
-                batch_start_time = time_module.time()
-                
                 # Read batch of chunks from database
                 cursor.execute("""
                     SELECT id, text, title
@@ -168,17 +148,17 @@ class HybridRetriever:
                 if not chunk_batch:
                     break
                 
-                # Process embeddings in sub-batches (larger for better GPU utilization)
+                # Process embeddings in sub-batches
                 for i in range(0, len(chunk_batch), embedding_batch_size):
                     sub_batch = chunk_batch[i:i+embedding_batch_size]
                     
-                    # Create texts for embedding (combine title and text for context)
+                    # Create texts for embedding
                     texts = [f"{row[2]}: {row[1][:500]}" for row in sub_batch]
                     
-                    # Generate embeddings with larger batch for GPU efficiency
+                    # Generate embeddings
                     embeddings = self.embedding_model.encode(
                         texts,
-                        batch_size=256,  # Increased from 64 to better utilize GPU
+                        batch_size=256,
                         show_progress_bar=False,
                         convert_to_numpy=True
                     )
@@ -186,14 +166,37 @@ class HybridRetriever:
                     embeddings = embeddings.astype('float32')
                     faiss.normalize_L2(embeddings)
                     
-                    # Add to FAISS index
-                    self.faiss_index.add(embeddings)
-                    
-                    # Store ID mapping
+                    # Buffer embeddings (safer than vstack on GPU results)
+                    embedding_buffer.append(embeddings)
                     for j, row in enumerate(sub_batch):
-                        self.id_mapping[vector_index + j] = row[0]
+                        id_buffer.append(row[0])
                     
-                    vector_index += len(sub_batch)
+                    # When buffer reaches insertion size, add all at once
+                    if len(embedding_buffer) * embedding_batch_size >= batch_insert_size:
+                        try:
+                            # Safely concatenate on CPU memory
+                            all_embeddings = np.concatenate(embedding_buffer, axis=0)
+                            self.faiss_index.add(all_embeddings)
+                            
+                            # Map IDs
+                            for j, chunk_id in enumerate(id_buffer):
+                                self.id_mapping[vector_index + j] = chunk_id
+                            
+                            vector_index += len(id_buffer)
+                            embedding_buffer = []
+                            id_buffer = []
+                        except Exception as e:
+                            logger.error(f"Error adding batch: {e}. Retrying with smaller batch...")
+                            # Fallback: add individually with error handling
+                            for emb, chunk_id in zip(embedding_buffer[-1], id_buffer[-embedding_batch_size:]):
+                                try:
+                                    self.faiss_index.add(np.array([emb], dtype='float32'))
+                                    self.id_mapping[vector_index] = chunk_id
+                                    vector_index += 1
+                                except:
+                                    pass
+                            embedding_buffer = embedding_buffer[:-1]
+                            id_buffer = id_buffer[:-embedding_batch_size]
                 
                 processed += len(chunk_batch)
                 current_time = time_module.time()
@@ -218,7 +221,7 @@ class HybridRetriever:
                     mem_info = process.memory_info()
                     mem_mb = mem_info.rss / (1024 * 1024)
                     percent_done = (processed / total_chunks) * 100
-                    percent_ram = (mem_mb / (128 * 1024)) * 100  # Assuming 128GB system
+                    percent_ram = (mem_mb / (128 * 1024)) * 100
                     
                     elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m {int(elapsed % 60)}s"
                     
@@ -236,6 +239,15 @@ class HybridRetriever:
                     
                     last_progress_time = current_time
                     last_progress_chunks = processed
+            
+            # Flush any remaining embeddings in buffer
+            if embedding_buffer:
+                logger.info(f"   Flushing {len(id_buffer)} remaining embeddings...")
+                all_embeddings = np.concatenate(embedding_buffer, axis=0)
+                self.faiss_index.add(all_embeddings)
+                
+                for j, chunk_id in enumerate(id_buffer):
+                    self.id_mapping[vector_index + j] = chunk_id
             
             # Save index
             faiss.write_index(self.faiss_index, str(FAISS_INDEX_PATH))
