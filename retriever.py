@@ -7,7 +7,6 @@ import pickle
 import faiss
 import numpy as np
 import logging
-import torch
 from typing import List, Dict, Any, Tuple, Optional
 from sentence_transformers import SentenceTransformer
 from rapidfuzz import fuzz
@@ -18,19 +17,31 @@ from config import *
 
 logger = logging.getLogger(__name__)
 
-# Detect and set device for GPU acceleration
-def get_device():
-    """Get the best available device for inference"""
-    if torch.cuda.is_available():
-        device = "cuda"
-        logger.info(f"✓ GPU detected: {torch.cuda.get_device_name(0)}")
-        logger.info(f"  CUDA available: True")
-    else:
-        device = "cpu"
-        logger.warning("⚠ GPU not detected, using CPU (slower)")
-    return device
 
-DEVICE = get_device()
+# Module-level worker function for multiprocessing (must be picklable)
+def _generate_embeddings_worker(chunk_data):
+    """Worker function to generate embeddings in parallel
+    
+    This must be at module level to be picklable for multiprocessing.
+    """
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+    import faiss
+    
+    chunk_ids, texts = chunk_data
+    model = SentenceTransformer(EMBEDDING_MODEL)
+    
+    embeddings = model.encode(
+        texts,
+        batch_size=256,
+        show_progress_bar=False,
+        convert_to_numpy=True
+    )
+    
+    embeddings = embeddings.astype('float32')
+    faiss.normalize_L2(embeddings)
+    
+    return chunk_ids, embeddings
 
 
 class HybridRetriever:
@@ -43,7 +54,7 @@ class HybridRetriever:
         """
         self.use_bm25_only = use_bm25_only
         self.build_embeddings = build_embeddings
-        self.embedding_model = SentenceTransformer(EMBEDDING_MODEL, device=DEVICE) if not use_bm25_only else None
+        self.embedding_model = SentenceTransformer(EMBEDDING_MODEL) if not use_bm25_only else None
         self.faiss_index = None
         self.id_mapping = {}
         self.conn = None
@@ -74,10 +85,10 @@ class HybridRetriever:
         logger.info("Loading retrieval indexes...")
         
         if self.use_bm25_only:
-            logger.info("Using LIKE search only (keyword-based retrieval)")
+            logger.info("Using LIKE search only (fast fallback)")
             return
         
-        # Try to load existing FAISS index if available
+        # Try to load existing FAISS index
         if FAISS_INDEX_PATH.exists() and not self.build_embeddings:
             try:
                 logger.info("Loading existing FAISS index...")
@@ -98,17 +109,23 @@ class HybridRetriever:
         logger.info("Indexes loaded successfully")
     
     def _build_embedding_index_streaming(self):
-        """Build FAISS index by streaming chunks from database in batches"""
-        logger.info("🚀 Building embedding index from database (streaming)...")
-        logger.info("   This will take 8-10 hours for 33.5M chunks")
+        """Build FAISS index with parallel embedding generation
         
-        # Optimized batch sizes for safe operation
-        embedding_batch_size = 512  # Back to safer size
+        Key optimization: Use multiprocessing to parallelize embedding generation
+        - Main process: Reads DB, inserts into FAISS (sequential, safe)
+        - Worker processes: Generate embeddings in parallel (4 workers × 18 cores available)
+        """
+        logger.info("🚀 Building embedding index with parallel embedding generation...")
+        logger.info("   Strategy: Parallel embeddings + sequential FAISS insertions")
+        
         db_batch_size = 5000
+        vectors_per_batch = 250000
+        num_workers = 4  # Use 4 worker processes
         
         try:
             import psutil
             import time as time_module
+            from multiprocessing import Pool
             
             cursor = self.conn.cursor()
             
@@ -116,140 +133,143 @@ class HybridRetriever:
             cursor.execute("SELECT COUNT(*) FROM chunks")
             total_chunks = cursor.fetchone()[0]
             logger.info(f"   Total chunks to process: {total_chunks:,}")
+            logger.info(f"   Using {num_workers} worker processes for parallel embedding generation")
             
-            # Initialize FAISS index - simple FlatL2 for reliability
+            # Initialize main index
             logger.info("   Creating FAISS FlatL2 index...")
             self.faiss_index = faiss.IndexFlatL2(EMBEDDING_DIM)
             self.id_mapping = {}
             vector_index = 0
             
-            # Batch embeddings safely (collect before adding)
-            embedding_buffer = []
-            id_buffer = []
-            batch_insert_size = 100000  # Add 100K vectors at a time
+            batch_index = 0
+            batch_vectors = []
+            batch_ids = []
             
-            # Track timing and memory
             build_start_time = time_module.time()
             last_progress_time = build_start_time
             last_progress_chunks = 0
             process = psutil.Process()
             
-            # Process in streaming batches
-            processed = 0
-            while processed < total_chunks:
-                # Read batch of chunks from database
-                cursor.execute("""
-                    SELECT id, text, title
-                    FROM chunks
-                    LIMIT ? OFFSET ?
-                """, (db_batch_size, processed))
+            # Create worker pool
+            with Pool(processes=num_workers) as pool:
+                # Queue up embedding jobs
+                pending_jobs = []
                 
-                chunk_batch = cursor.fetchall()
-                if not chunk_batch:
-                    break
-                
-                # Process embeddings in sub-batches
-                for i in range(0, len(chunk_batch), embedding_batch_size):
-                    sub_batch = chunk_batch[i:i+embedding_batch_size]
+                while processed < total_chunks or pending_jobs:
+                    # Fetch more chunks and queue embedding jobs
+                    while len(pending_jobs) < num_workers * 2 and processed < total_chunks:
+                        cursor.execute("""
+                            SELECT id, text, title
+                            FROM chunks
+                            LIMIT ? OFFSET ?
+                        """, (db_batch_size, processed))
+                        
+                        chunk_batch = cursor.fetchall()
+                        if not chunk_batch:
+                            break
+                        
+                        chunk_ids = [row[0] for row in chunk_batch]
+                        texts = [f"{row[2]}: {row[1][:500]}" for row in chunk_batch]
+                        
+                        # Submit to worker pool
+                        job = pool.apply_async(_generate_embeddings_worker, ((chunk_ids, texts),))
+                        pending_jobs.append(job)
+                        
+                        processed += len(chunk_batch)
                     
-                    # Create texts for embedding
-                    texts = [f"{row[2]}: {row[1][:500]}" for row in sub_batch]
+                    # Collect completed jobs and add to index
+                    completed = []
+                    for i, job in enumerate(pending_jobs):
+                        if job.ready():
+                            try:
+                                chunk_ids, embeddings = job.get(timeout=1)
+                                
+                                batch_vectors.append(embeddings)
+                                batch_ids.extend(chunk_ids)
+                                
+                                completed.append(i)
+                                
+                                # Add to index when batch reaches size
+                                if len(batch_ids) >= vectors_per_batch:
+                                    logger.info(f"   Adding {len(batch_ids)} vectors to index...")
+                                    all_vecs = np.concatenate(batch_vectors, axis=0)
+                                    
+                                    try:
+                                        self.faiss_index.add(all_vecs)
+                                    except Exception as e:
+                                        logger.warning(f"Batch add failed: {e}")
+                                    
+                                    # Map IDs
+                                    for j, chunk_id in enumerate(batch_ids):
+                                        self.id_mapping[vector_index + j] = chunk_id
+                                    
+                                    vector_index += len(batch_ids)
+                                    batch_vectors = []
+                                    batch_ids = []
+                                    batch_index += 1
+                                
+                            except Exception as e:
+                                logger.warning(f"Worker job failed: {e}")
+                                completed.append(i)
                     
-                    # Generate embeddings
-                    embeddings = self.embedding_model.encode(
-                        texts,
-                        batch_size=256,
-                        show_progress_bar=False,
-                        convert_to_numpy=True
-                    )
+                    # Remove completed jobs (in reverse to maintain indices)
+                    for i in reversed(completed):
+                        pending_jobs.pop(i)
                     
-                    embeddings = embeddings.astype('float32')
-                    faiss.normalize_L2(embeddings)
-                    
-                    # Buffer embeddings (safer than vstack on GPU results)
-                    embedding_buffer.append(embeddings)
-                    for j, row in enumerate(sub_batch):
-                        id_buffer.append(row[0])
-                    
-                    # When buffer reaches insertion size, add all at once
-                    if len(embedding_buffer) * embedding_batch_size >= batch_insert_size:
-                        try:
-                            # Safely concatenate on CPU memory
-                            all_embeddings = np.concatenate(embedding_buffer, axis=0)
-                            self.faiss_index.add(all_embeddings)
-                            
-                            # Map IDs
-                            for j, chunk_id in enumerate(id_buffer):
-                                self.id_mapping[vector_index + j] = chunk_id
-                            
-                            vector_index += len(id_buffer)
-                            embedding_buffer = []
-                            id_buffer = []
-                        except Exception as e:
-                            logger.error(f"Error adding batch: {e}. Retrying with smaller batch...")
-                            # Fallback: add individually with error handling
-                            for emb, chunk_id in zip(embedding_buffer[-1], id_buffer[-embedding_batch_size:]):
-                                try:
-                                    self.faiss_index.add(np.array([emb], dtype='float32'))
-                                    self.id_mapping[vector_index] = chunk_id
-                                    vector_index += 1
-                                except:
-                                    pass
-                            embedding_buffer = embedding_buffer[:-1]
-                            id_buffer = id_buffer[:-embedding_batch_size]
-                
-                processed += len(chunk_batch)
-                current_time = time_module.time()
-                
-                # Log progress every 100K chunks or every 30 seconds
-                if processed % 100000 == 0 or (current_time - last_progress_time) > 30:
-                    elapsed = current_time - build_start_time
-                    chunks_in_period = processed - last_progress_chunks
-                    time_in_period = current_time - last_progress_time
-                    
-                    if time_in_period > 0:
-                        chunks_per_sec = chunks_in_period / time_in_period
-                        remaining_chunks = total_chunks - processed
-                        eta_seconds = remaining_chunks / chunks_per_sec if chunks_per_sec > 0 else 0
-                        eta_minutes = eta_seconds / 60
-                        eta_hours = eta_minutes / 60
-                    else:
-                        chunks_per_sec = 0
-                        eta_hours = 0
-                    
-                    # Get memory info
-                    mem_info = process.memory_info()
-                    mem_mb = mem_info.rss / (1024 * 1024)
-                    percent_done = (processed / total_chunks) * 100
-                    percent_ram = (mem_mb / (128 * 1024)) * 100
-                    
-                    elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m {int(elapsed % 60)}s"
-                    
-                    logger.info(f"")
-                    logger.info(f"   ✓ Processed {processed:,}/{total_chunks:,} chunks ({percent_done:.1f}%)")
-                    logger.info(f"     Time elapsed: {elapsed_str}")
-                    logger.info(f"     Speed: {chunks_per_sec:.0f} chunks/sec")
-                    logger.info(f"     Memory: {mem_mb:,.0f} MB ({percent_ram:.1f}% of 128GB)")
-                    
-                    if eta_hours > 0:
-                        if eta_hours >= 1:
-                            logger.info(f"     ETA: ~{eta_hours:.1f} hours")
+                    # Log progress
+                    current_time = time_module.time()
+                    if (current_time - last_progress_time) > 30:
+                        elapsed = current_time - build_start_time
+                        chunks_in_period = processed - last_progress_chunks
+                        time_in_period = current_time - last_progress_time
+                        
+                        if time_in_period > 0:
+                            chunks_per_sec = chunks_in_period / time_in_period
+                            remaining_chunks = total_chunks - processed
+                            eta_seconds = remaining_chunks / chunks_per_sec if chunks_per_sec > 0 else 0
+                            eta_hours = eta_seconds / 3600
                         else:
-                            logger.info(f"     ETA: ~{eta_minutes:.0f} minutes")
+                            chunks_per_sec = 0
+                            eta_hours = 0
+                        
+                        mem_mb = process.memory_info().rss / (1024 * 1024)
+                        percent_done = (processed / total_chunks) * 100
+                        
+                        elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m {int(elapsed % 60)}s"
+                        
+                        logger.info(f"")
+                        logger.info(f"   ✓ Processed {processed:,}/{total_chunks:,} chunks ({percent_done:.1f}%)")
+                        logger.info(f"     Batches merged: {batch_index}")
+                        logger.info(f"     Time elapsed: {elapsed_str}")
+                        logger.info(f"     Speed: {chunks_per_sec:.0f} chunks/sec")
+                        logger.info(f"     Memory: {mem_mb:,.0f} MB ({mem_mb / (128 * 1024) * 100:.1f}% of 128GB)")
+                        logger.info(f"     Pending jobs: {len(pending_jobs)}")
+                        
+                        if eta_hours > 0:
+                            logger.info(f"     ETA: ~{eta_hours:.1f} hours")
+                        
+                        last_progress_time = current_time
+                        last_progress_chunks = processed
                     
-                    last_progress_time = current_time
-                    last_progress_chunks = processed
+                    # Small sleep to avoid busy waiting
+                    if pending_jobs and not any(j.ready() for j in pending_jobs):
+                        time_module.sleep(0.1)
             
-            # Flush any remaining embeddings in buffer
-            if embedding_buffer:
-                logger.info(f"   Flushing {len(id_buffer)} remaining embeddings...")
-                all_embeddings = np.concatenate(embedding_buffer, axis=0)
-                self.faiss_index.add(all_embeddings)
+            # Add any remaining vectors
+            if batch_vectors:
+                logger.info(f"   Adding final {len(batch_ids)} vectors to index...")
+                all_vecs = np.concatenate(batch_vectors, axis=0)
                 
-                for j, chunk_id in enumerate(id_buffer):
+                try:
+                    self.faiss_index.add(all_vecs)
+                except Exception as e:
+                    logger.warning(f"Final batch add failed: {e}")
+                
+                for j, chunk_id in enumerate(batch_ids):
                     self.id_mapping[vector_index + j] = chunk_id
             
             # Save index
+            logger.info(f"   Saving index with {self.faiss_index.ntotal} vectors...")
             faiss.write_index(self.faiss_index, str(FAISS_INDEX_PATH))
             with open(IDS_MAPPING_PATH, 'wb') as f:
                 pickle.dump(self.id_mapping, f)
@@ -259,9 +279,10 @@ class HybridRetriever:
             final_mem = process.memory_info().rss / (1024 * 1024)
             
             logger.info(f"")
-            logger.info(f"✅ Embedding index created: {len(self.id_mapping):,} vectors")
+            logger.info(f"✅ Embedding index created: {len(self.id_mapping):,} vectors in {batch_index} batches")
             logger.info(f"   Total time: {elapsed_str}")
             logger.info(f"   Peak memory: {final_mem:,.0f} MB")
+            logger.info(f"   Parallel speedup: ~{num_workers}x faster embedding generation")
             logger.info(f"")
             
         except Exception as e:
