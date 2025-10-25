@@ -29,6 +29,47 @@ def _init_worker_process():
     _worker_model = SentenceTransformer(EMBEDDING_MODEL)
 
 
+class _JobIterator:
+    """Iterator that yields jobs from database on-demand (streaming, no pre-loading)"""
+    
+    def __init__(self, db_path, db_batch_size, total_chunks):
+        self.db_path = db_path
+        self.db_batch_size = db_batch_size
+        self.total_chunks = total_chunks
+        self.offset = 0
+    
+    def __iter__(self):
+        return self
+    
+    def __next__(self):
+        if self.offset >= self.total_chunks:
+            raise StopIteration
+        
+        # Create connection in this process (not shared)
+        import sqlite3
+        conn = sqlite3.connect(str(self.db_path), timeout=30)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT id, text, title
+            FROM chunks
+            LIMIT ? OFFSET ?
+        """, (self.db_batch_size, self.offset))
+        
+        chunk_batch = cursor.fetchall()
+        conn.close()
+        
+        if not chunk_batch:
+            raise StopIteration
+        
+        chunk_ids = [row[0] for row in chunk_batch]
+        texts = [f"{row[2]}: {row[1][:500]}" for row in chunk_batch]
+        
+        self.offset += len(chunk_batch)
+        
+        return (chunk_ids, texts)
+
+
 # Module-level worker function for multiprocessing (must be picklable)
 def _generate_embeddings_worker(chunk_data):
     """Worker function to generate embeddings in parallel
@@ -182,42 +223,18 @@ class HybridRetriever:
                         pass
                 logger.info("   ✓ Worker pool initialized and ready")
                 
-                # Load all job data in main thread (SQLite safe)
-                # Then iterate through them for workers
-                logger.info("   Loading all embedding jobs from database...")
-                load_start = time_module.time()
-                all_jobs = []
-                
-                cursor.execute("SELECT COUNT(*) FROM chunks")
-                total_chunks_check = cursor.fetchone()[0]
-                
-                # Pre-generate all job data in main thread (thread-safe)
-                for offset in range(0, total_chunks_check, db_batch_size):
-                    cursor.execute("""
-                        SELECT id, text, title
-                        FROM chunks
-                        LIMIT ? OFFSET ?
-                    """, (db_batch_size, offset))
-                    
-                    chunk_batch = cursor.fetchall()
-                    if not chunk_batch:
-                        break
-                    
-                    chunk_ids = [row[0] for row in chunk_batch]
-                    texts = [f"{row[2]}: {row[1][:500]}" for row in chunk_batch]
-                    all_jobs.append((chunk_ids, texts))
-                
-                load_time = time_module.time() - load_start
-                logger.info(f"   ✓ Loaded {len(all_jobs)} jobs in {load_time:.1f}s, starting parallel processing...")
+                # Create streaming job iterator (yields batches on-demand)
+                logger.info("   Starting parallel embedding generation (streaming from database)...")
+                job_iterator = _JobIterator(SQLITE_DB_PATH, db_batch_size, total_chunks)
                 
                 # Process with imap_unordered for true parallelism
-                # Jobs are already loaded, so no thread safety issues
+                # Iterator yields jobs one at a time (no pre-loading)
                 batch_index = 0
                 batch_vectors = []
                 batch_ids = []
                 vector_index = 0
                 
-                for chunk_ids, embeddings in pool.imap_unordered(_generate_embeddings_worker, all_jobs, chunksize=1):
+                for chunk_ids, embeddings in pool.imap_unordered(_generate_embeddings_worker, job_iterator, chunksize=1):
                     batch_vectors.append(embeddings)
                     batch_ids.extend(chunk_ids)
                     processed += len(chunk_ids)

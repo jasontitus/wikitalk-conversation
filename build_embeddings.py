@@ -47,41 +47,30 @@ def main():
     if FAISS_INDEX_PATH.exists():
         logger.info(f"✓ FAISS index already exists: {FAISS_INDEX_PATH}")
         logger.info(f"   Size: {FAISS_INDEX_PATH.stat().st_size / (1024 ** 3):.1f} GB")
-        
-        response = input("\n❓ Rebuild index? (y/n): ").strip().lower()
-        if response != 'y':
-            logger.info("Skipping rebuild")
-            return True
+        logger.info("   Rebuilding index from scratch...")
     
     logger.info("\n🔧 Initializing retriever with embedding building...")
     logger.info("   This will:")
     logger.info("   1. Stream all 33.5M chunks from database")
-    logger.info("   2. Generate embeddings in batches")
+    logger.info("   2. Generate embeddings in parallel (4 workers)")
     logger.info("   3. Create FAISS index")
     logger.info("   4. Save index to disk")
     
-    logger.info("\n⏱️  Estimated time:")
-    logger.info("   - GPU (NVIDIA): 1-2 hours")
-    logger.info("   - GPU (M3 Max): 4-6 hours")
-    logger.info("   - CPU: 6-12 hours")
+    logger.info("\n⏱️  Expected time:")
+    logger.info("   - GPU (M3 Max with 4 workers): ~4-6 hours")
+    logger.info("   - CPU (18 cores): ~6-12 hours")
     
-    logger.info("\n📊 Memory prediction:")
-    logger.info("   - Model load: ~2-3 GB")
-    logger.info("   - Index building: 10-20 MB per batch")
-    logger.info("   - Peak usage: ~30-50 GB (should be fine with 128GB)")
+    logger.info("\n📊 Memory profile:")
+    logger.info("   - Model per worker: ~1-2 GB")
+    logger.info("   - Batch processing: ~100 MB working memory")
     logger.info("   - Final index: ~15 GB")
-    
-    response = input("\n❓ Continue? (y/n): ").strip().lower()
-    if response != 'y':
-        logger.info("Cancelled")
-        return False
     
     # Monitor during build
     logger.info("\n" + "=" * 70)
     logger.info("📈 Build Progress Monitor")
     logger.info("=" * 70)
-    logger.info("   Progress updates every 30 seconds or every 100K chunks")
-    logger.info("   Watch memory and ETA to estimate completion time")
+    logger.info("   Progress updates every 30 seconds")
+    logger.info("   Ctrl+C to cancel (can resume by running again)")
     logger.info("=" * 70 + "\n")
     
     # Build index
