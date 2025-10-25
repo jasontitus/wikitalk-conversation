@@ -166,69 +166,76 @@ class HybridRetriever:
             
             # Create worker pool
             with Pool(processes=num_workers, initializer=_init_worker_process) as pool:
-                # Queue up embedding jobs
-                pending_jobs = []
+                # Pre-warm worker pool - submit dummy jobs to trigger initialization
+                logger.info("   Pre-warming worker pool (initializing models in workers)...")
+                warmup_jobs = []
+                for i in range(num_workers):
+                    dummy_data = ([999999], ["dummy text for initialization"])
+                    job = pool.apply_async(_generate_embeddings_worker, (dummy_data,))
+                    warmup_jobs.append(job)
                 
-                while processed < total_chunks or pending_jobs:
-                    # Fetch more chunks and queue embedding jobs
-                    while len(pending_jobs) < num_workers * 2 and processed < total_chunks:
-                        cursor.execute("""
-                            SELECT id, text, title
-                            FROM chunks
-                            LIMIT ? OFFSET ?
-                        """, (db_batch_size, processed))
-                        
-                        chunk_batch = cursor.fetchall()
-                        if not chunk_batch:
-                            break
-                        
-                        chunk_ids = [row[0] for row in chunk_batch]
-                        texts = [f"{row[2]}: {row[1][:500]}" for row in chunk_batch]
-                        
-                        # Submit to worker pool
-                        job = pool.apply_async(_generate_embeddings_worker, ((chunk_ids, texts),))
-                        pending_jobs.append(job)
-                        
-                        processed += len(chunk_batch)
+                # Wait for all warmup jobs to complete
+                for job in warmup_jobs:
+                    try:
+                        job.get(timeout=60)
+                    except:
+                        pass
+                logger.info("   ✓ Worker pool initialized and ready")
+                
+                # Prepare all embedding jobs
+                logger.info("   Queuing all embedding jobs for parallel processing...")
+                all_jobs = []
+                
+                cursor.execute("SELECT COUNT(*) FROM chunks")
+                total_chunks_check = cursor.fetchone()[0]
+                
+                # Pre-generate all job data
+                for offset in range(0, total_chunks_check, db_batch_size):
+                    cursor.execute("""
+                        SELECT id, text, title
+                        FROM chunks
+                        LIMIT ? OFFSET ?
+                    """, (db_batch_size, offset))
                     
-                    # Collect completed jobs and add to index
-                    completed = []
-                    for i, job in enumerate(pending_jobs):
-                        if job.ready():
-                            try:
-                                chunk_ids, embeddings = job.get(timeout=1)
-                                
-                                batch_vectors.append(embeddings)
-                                batch_ids.extend(chunk_ids)
-                                
-                                completed.append(i)
-                                
-                                # Add to index when batch reaches size
-                                if len(batch_ids) >= vectors_per_batch:
-                                    logger.info(f"   Adding {len(batch_ids)} vectors to index...")
-                                    all_vecs = np.concatenate(batch_vectors, axis=0)
-                                    
-                                    try:
-                                        self.faiss_index.add(all_vecs)
-                                    except Exception as e:
-                                        logger.warning(f"Batch add failed: {e}")
-                                    
-                                    # Map IDs
-                                    for j, chunk_id in enumerate(batch_ids):
-                                        self.id_mapping[vector_index + j] = chunk_id
-                                    
-                                    vector_index += len(batch_ids)
-                                    batch_vectors = []
-                                    batch_ids = []
-                                    batch_index += 1
-                                
-                            except Exception as e:
-                                logger.warning(f"Worker job failed: {e}")
-                                completed.append(i)
+                    chunk_batch = cursor.fetchall()
+                    if not chunk_batch:
+                        break
                     
-                    # Remove completed jobs (in reverse to maintain indices)
-                    for i in reversed(completed):
-                        pending_jobs.pop(i)
+                    chunk_ids = [row[0] for row in chunk_batch]
+                    texts = [f"{row[2]}: {row[1][:500]}" for row in chunk_batch]
+                    all_jobs.append((chunk_ids, texts))
+                
+                logger.info(f"   Queued {len(all_jobs)} embedding jobs")
+                
+                # Process with imap_unordered for true parallelism
+                batch_index = 0
+                batch_vectors = []
+                batch_ids = []
+                vector_index = 0
+                
+                for chunk_ids, embeddings in pool.imap_unordered(_generate_embeddings_worker, all_jobs, chunksize=1):
+                    batch_vectors.append(embeddings)
+                    batch_ids.extend(chunk_ids)
+                    processed += len(chunk_ids)
+                    
+                    # Add to index when batch reaches size
+                    if len(batch_ids) >= vectors_per_batch:
+                        logger.info(f"   Adding {len(batch_ids)} vectors to index...")
+                        all_vecs = np.concatenate(batch_vectors, axis=0)
+                        
+                        try:
+                            self.faiss_index.add(all_vecs)
+                        except Exception as e:
+                            logger.warning(f"Batch add failed: {e}")
+                        
+                        # Map IDs
+                        for j, chunk_id in enumerate(batch_ids):
+                            self.id_mapping[vector_index + j] = chunk_id
+                        
+                        vector_index += len(batch_ids)
+                        batch_vectors = []
+                        batch_ids = []
+                        batch_index += 1
                     
                     # Log progress
                     current_time = time_module.time()
@@ -257,17 +264,12 @@ class HybridRetriever:
                         logger.info(f"     Time elapsed: {elapsed_str}")
                         logger.info(f"     Speed: {chunks_per_sec:.0f} chunks/sec")
                         logger.info(f"     Memory: {mem_mb:,.0f} MB ({mem_mb / (128 * 1024) * 100:.1f}% of 128GB)")
-                        logger.info(f"     Pending jobs: {len(pending_jobs)}")
                         
                         if eta_hours > 0:
                             logger.info(f"     ETA: ~{eta_hours:.1f} hours")
                         
                         last_progress_time = current_time
                         last_progress_chunks = processed
-                    
-                    # Small sleep to avoid busy waiting
-                    if pending_jobs and not any(j.ready() for j in pending_jobs):
-                        time_module.sleep(0.1)
             
             # Add any remaining vectors
             if batch_vectors:
