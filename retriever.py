@@ -18,85 +18,6 @@ from config import *
 logger = logging.getLogger(__name__)
 
 
-# Global variable for worker processes (each process gets its own copy)
-_worker_model = None
-
-
-def _init_worker_process():
-    """Initialize worker process with model (called once per worker)"""
-    global _worker_model
-    from sentence_transformers import SentenceTransformer
-    _worker_model = SentenceTransformer(EMBEDDING_MODEL)
-
-
-class _JobIterator:
-    """Iterator that yields jobs from database on-demand (streaming, no pre-loading)"""
-    
-    def __init__(self, db_path, db_batch_size, total_chunks):
-        self.db_path = db_path
-        self.db_batch_size = db_batch_size
-        self.total_chunks = total_chunks
-        self.offset = 0
-    
-    def __iter__(self):
-        return self
-    
-    def __next__(self):
-        if self.offset >= self.total_chunks:
-            raise StopIteration
-        
-        # Create connection in this process (not shared)
-        import sqlite3
-        conn = sqlite3.connect(str(self.db_path), timeout=30)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT id, text, title
-            FROM chunks
-            LIMIT ? OFFSET ?
-        """, (self.db_batch_size, self.offset))
-        
-        chunk_batch = cursor.fetchall()
-        conn.close()
-        
-        if not chunk_batch:
-            raise StopIteration
-        
-        chunk_ids = [row[0] for row in chunk_batch]
-        texts = [f"{row[2]}: {row[1][:500]}" for row in chunk_batch]
-        
-        self.offset += len(chunk_batch)
-        
-        return (chunk_ids, texts)
-
-
-# Module-level worker function for multiprocessing (must be picklable)
-def _generate_embeddings_worker(chunk_data):
-    """Worker function to generate embeddings in parallel
-    
-    This must be at module level to be picklable for multiprocessing.
-    Uses global model loaded once per worker process.
-    """
-    import numpy as np
-    import faiss
-    
-    global _worker_model
-    chunk_ids, texts = chunk_data
-    
-    # Model already loaded by initializer
-    embeddings = _worker_model.encode(
-        texts,
-        batch_size=256,
-        show_progress_bar=False,
-        convert_to_numpy=True
-    )
-    
-    embeddings = embeddings.astype('float32')
-    faiss.normalize_L2(embeddings)
-    
-    return chunk_ids, embeddings
-
-
 class HybridRetriever:
     def __init__(self, use_bm25_only=False, build_embeddings=False):
         """Initialize retriever
@@ -162,23 +83,26 @@ class HybridRetriever:
         logger.info("Indexes loaded successfully")
     
     def _build_embedding_index_streaming(self):
-        """Build FAISS index with parallel embedding generation
+        """Build FAISS index with simple sequential batching
         
-        Key optimization: Use multiprocessing to parallelize embedding generation
-        - Main process: Reads DB, inserts into FAISS (sequential, safe)
-        - Worker processes: Generate embeddings in parallel (4 workers × 18 cores available)
+        After trying various parallel approaches:
+        - Multiprocessing overhead > benefit
+        - Database connection per batch kills performance
+        - Simple streaming with proper batching is fastest
+        
+        Strategy: Single thread, stream batches from DB, insert to FAISS
+        Key insight: Larger FAISS insertion batches = fewer insertions = consistent speed
         """
-        logger.info("🚀 Building embedding index with parallel embedding generation...")
-        logger.info("   Strategy: Parallel embeddings + sequential FAISS insertions")
+        logger.info("🚀 Building embedding index (simple sequential batching)...")
+        logger.info("   Reading database → generating embeddings → inserting to FAISS")
         
+        embedding_batch_size = 512
         db_batch_size = 5000
-        vectors_per_batch = 250000
-        num_workers = 4  # Use 4 worker processes
+        vectors_per_batch = 1500000  # Larger batches = fewer insertions = faster (1.5M instead of 250K)
         
         try:
             import psutil
             import time as time_module
-            from multiprocessing import Pool
             
             cursor = self.conn.cursor()
             
@@ -186,7 +110,6 @@ class HybridRetriever:
             cursor.execute("SELECT COUNT(*) FROM chunks")
             total_chunks = cursor.fetchone()[0]
             logger.info(f"   Total chunks to process: {total_chunks:,}")
-            logger.info(f"   Using {num_workers} worker processes for parallel embedding generation")
             
             # Initialize main index
             logger.info("   Creating FAISS FlatL2 index...")
@@ -203,43 +126,44 @@ class HybridRetriever:
             last_progress_chunks = 0
             process = psutil.Process()
             
+            # Process in streaming batches
             processed = 0
-            
-            # Create worker pool
-            with Pool(processes=num_workers, initializer=_init_worker_process) as pool:
-                # Pre-warm worker pool
-                logger.info("   Pre-warming worker pool (initializing models in workers)...")
-                warmup_jobs = []
-                for i in range(num_workers):
-                    dummy_data = ([999999], ["dummy text for initialization"])
-                    job = pool.apply_async(_generate_embeddings_worker, (dummy_data,))
-                    warmup_jobs.append(job)
+            while processed < total_chunks:
+                # Read batch of chunks from database
+                cursor.execute("""
+                    SELECT id, text, title
+                    FROM chunks
+                    LIMIT ? OFFSET ?
+                """, (db_batch_size, processed))
                 
-                # Wait for all warmup jobs to complete
-                for job in warmup_jobs:
-                    try:
-                        job.get(timeout=60)
-                    except:
-                        pass
-                logger.info("   ✓ Worker pool initialized and ready")
+                chunk_batch = cursor.fetchall()
+                if not chunk_batch:
+                    break
                 
-                # Create streaming job iterator (yields batches on-demand)
-                logger.info("   Starting parallel embedding generation (streaming from database)...")
-                job_iterator = _JobIterator(SQLITE_DB_PATH, db_batch_size, total_chunks)
-                
-                # Process with imap_unordered for true parallelism
-                # Iterator yields jobs one at a time (no pre-loading)
-                batch_index = 0
-                batch_vectors = []
-                batch_ids = []
-                vector_index = 0
-                
-                for chunk_ids, embeddings in pool.imap_unordered(_generate_embeddings_worker, job_iterator, chunksize=1):
-                    batch_vectors.append(embeddings)
-                    batch_ids.extend(chunk_ids)
-                    processed += len(chunk_ids)
+                # Process embeddings in sub-batches
+                for i in range(0, len(chunk_batch), embedding_batch_size):
+                    sub_batch = chunk_batch[i:i+embedding_batch_size]
                     
-                    # Add to index when batch reaches size
+                    # Create texts for embedding
+                    texts = [f"{row[2]}: {row[1][:500]}" for row in sub_batch]
+                    
+                    # Generate embeddings
+                    embeddings = self.embedding_model.encode(
+                        texts,
+                        batch_size=256,
+                        show_progress_bar=False,
+                        convert_to_numpy=True
+                    )
+                    
+                    embeddings = embeddings.astype('float32')
+                    faiss.normalize_L2(embeddings)
+                    
+                    # Accumulate vectors and IDs
+                    batch_vectors.append(embeddings)
+                    for row in sub_batch:
+                        batch_ids.append(row[0])
+                    
+                    # When batch reaches size, add to main index
                     if len(batch_ids) >= vectors_per_batch:
                         logger.info(f"   Adding {len(batch_ids)} vectors to index...")
                         all_vecs = np.concatenate(batch_vectors, axis=0)
@@ -257,40 +181,48 @@ class HybridRetriever:
                         batch_vectors = []
                         batch_ids = []
                         batch_index += 1
+                
+                processed += len(chunk_batch)
+                current_time = time_module.time()
+                
+                # Log progress every 30 seconds
+                if (current_time - last_progress_time) > 30:
+                    elapsed = current_time - build_start_time
+                    chunks_in_period = processed - last_progress_chunks
+                    time_in_period = current_time - last_progress_time
                     
-                    # Log progress
-                    current_time = time_module.time()
-                    if (current_time - last_progress_time) > 30:
-                        elapsed = current_time - build_start_time
-                        chunks_in_period = processed - last_progress_chunks
-                        time_in_period = current_time - last_progress_time
-                        
-                        if time_in_period > 0:
-                            chunks_per_sec = chunks_in_period / time_in_period
-                            remaining_chunks = total_chunks - processed
-                            eta_seconds = remaining_chunks / chunks_per_sec if chunks_per_sec > 0 else 0
-                            eta_hours = eta_seconds / 3600
-                        else:
-                            chunks_per_sec = 0
-                            eta_hours = 0
-                        
-                        mem_mb = process.memory_info().rss / (1024 * 1024)
-                        percent_done = (processed / total_chunks) * 100
-                        
-                        elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m {int(elapsed % 60)}s"
-                        
-                        logger.info(f"")
-                        logger.info(f"   ✓ Processed {processed:,}/{total_chunks:,} chunks ({percent_done:.1f}%)")
-                        logger.info(f"     Batches merged: {batch_index}")
-                        logger.info(f"     Time elapsed: {elapsed_str}")
-                        logger.info(f"     Speed: {chunks_per_sec:.0f} chunks/sec")
-                        logger.info(f"     Memory: {mem_mb:,.0f} MB ({mem_mb / (128 * 1024) * 100:.1f}% of 128GB)")
-                        
-                        if eta_hours > 0:
+                    if time_in_period > 0:
+                        chunks_per_sec = chunks_in_period / time_in_period
+                        remaining_chunks = total_chunks - processed
+                        eta_seconds = remaining_chunks / chunks_per_sec if chunks_per_sec > 0 else 0
+                        eta_hours = eta_seconds / 3600
+                    else:
+                        chunks_per_sec = 0
+                        eta_hours = 0
+                    
+                    # Get memory info
+                    mem_info = process.memory_info()
+                    mem_mb = mem_info.rss / (1024 * 1024)
+                    percent_done = (processed / total_chunks) * 100
+                    percent_ram = (mem_mb / (128 * 1024)) * 100
+                    
+                    elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m {int(elapsed % 60)}s"
+                    
+                    logger.info(f"")
+                    logger.info(f"   ✓ Processed {processed:,}/{total_chunks:,} chunks ({percent_done:.1f}%)")
+                    logger.info(f"     Batches merged: {batch_index}")
+                    logger.info(f"     Time elapsed: {elapsed_str}")
+                    logger.info(f"     Speed: {chunks_per_sec:.0f} chunks/sec")
+                    logger.info(f"     Memory: {mem_mb:,.0f} MB ({percent_ram:.1f}% of 128GB)")
+                    
+                    if eta_hours > 0:
+                        if eta_hours >= 1:
                             logger.info(f"     ETA: ~{eta_hours:.1f} hours")
-                        
-                        last_progress_time = current_time
-                        last_progress_chunks = processed
+                        else:
+                            logger.info(f"     ETA: ~{eta_hours * 60:.0f} minutes")
+                    
+                    last_progress_time = current_time
+                    last_progress_chunks = processed
             
             # Add any remaining vectors
             if batch_vectors:
@@ -319,7 +251,6 @@ class HybridRetriever:
             logger.info(f"✅ Embedding index created: {len(self.id_mapping):,} vectors in {batch_index} batches")
             logger.info(f"   Total time: {elapsed_str}")
             logger.info(f"   Peak memory: {final_mem:,.0f} MB")
-            logger.info(f"   Parallel speedup: ~{num_workers}x faster embedding generation")
             logger.info(f"")
             
         except Exception as e:
