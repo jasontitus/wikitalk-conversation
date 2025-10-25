@@ -182,32 +182,42 @@ class HybridRetriever:
                         pass
                 logger.info("   ✓ Worker pool initialized and ready")
                 
-                # Generator function for streaming jobs without pre-loading
-                def job_generator():
-                    """Yield embedding jobs as needed (streaming, not pre-loaded)"""
-                    for offset in range(0, total_chunks, db_batch_size):
-                        cursor.execute("""
-                            SELECT id, text, title
-                            FROM chunks
-                            LIMIT ? OFFSET ?
-                        """, (db_batch_size, offset))
-                        
-                        chunk_batch = cursor.fetchall()
-                        if not chunk_batch:
-                            break
-                        
-                        chunk_ids = [row[0] for row in chunk_batch]
-                        texts = [f"{row[2]}: {row[1][:500]}" for row in chunk_batch]
-                        yield (chunk_ids, texts)
+                # Load all job data in main thread (SQLite safe)
+                # Then iterate through them for workers
+                logger.info("   Loading all embedding jobs from database...")
+                load_start = time_module.time()
+                all_jobs = []
                 
-                # Process with imap for streaming parallelism
-                # imap maintains a buffer of ~num_workers*2 jobs
+                cursor.execute("SELECT COUNT(*) FROM chunks")
+                total_chunks_check = cursor.fetchone()[0]
+                
+                # Pre-generate all job data in main thread (thread-safe)
+                for offset in range(0, total_chunks_check, db_batch_size):
+                    cursor.execute("""
+                        SELECT id, text, title
+                        FROM chunks
+                        LIMIT ? OFFSET ?
+                    """, (db_batch_size, offset))
+                    
+                    chunk_batch = cursor.fetchall()
+                    if not chunk_batch:
+                        break
+                    
+                    chunk_ids = [row[0] for row in chunk_batch]
+                    texts = [f"{row[2]}: {row[1][:500]}" for row in chunk_batch]
+                    all_jobs.append((chunk_ids, texts))
+                
+                load_time = time_module.time() - load_start
+                logger.info(f"   ✓ Loaded {len(all_jobs)} jobs in {load_time:.1f}s, starting parallel processing...")
+                
+                # Process with imap_unordered for true parallelism
+                # Jobs are already loaded, so no thread safety issues
                 batch_index = 0
                 batch_vectors = []
                 batch_ids = []
                 vector_index = 0
                 
-                for chunk_ids, embeddings in pool.imap_unordered(_generate_embeddings_worker, job_generator(), chunksize=1):
+                for chunk_ids, embeddings in pool.imap_unordered(_generate_embeddings_worker, all_jobs, chunksize=1):
                     batch_vectors.append(embeddings)
                     batch_ids.extend(chunk_ids)
                     processed += len(chunk_ids)
