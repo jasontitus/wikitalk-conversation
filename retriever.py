@@ -18,20 +18,32 @@ from config import *
 logger = logging.getLogger(__name__)
 
 
+# Global variable for worker processes (each process gets its own copy)
+_worker_model = None
+
+
+def _init_worker_process():
+    """Initialize worker process with model (called once per worker)"""
+    global _worker_model
+    from sentence_transformers import SentenceTransformer
+    _worker_model = SentenceTransformer(EMBEDDING_MODEL)
+
+
 # Module-level worker function for multiprocessing (must be picklable)
 def _generate_embeddings_worker(chunk_data):
     """Worker function to generate embeddings in parallel
     
     This must be at module level to be picklable for multiprocessing.
+    Uses global model loaded once per worker process.
     """
-    from sentence_transformers import SentenceTransformer
     import numpy as np
     import faiss
     
+    global _worker_model
     chunk_ids, texts = chunk_data
-    model = SentenceTransformer(EMBEDDING_MODEL)
     
-    embeddings = model.encode(
+    # Model already loaded by initializer
+    embeddings = _worker_model.encode(
         texts,
         batch_size=256,
         show_progress_bar=False,
@@ -153,7 +165,7 @@ class HybridRetriever:
             processed = 0
             
             # Create worker pool
-            with Pool(processes=num_workers) as pool:
+            with Pool(processes=num_workers, initializer=_init_worker_process) as pool:
                 # Queue up embedding jobs
                 pending_jobs = []
                 
