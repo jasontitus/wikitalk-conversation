@@ -62,6 +62,10 @@ RETRIEVAL_TOPK = 40  # Restored from 10 for better search quality (FAISS speed n
 MEMORY_TURNS = 8
 TEMPERATURE = 0.2
 
+# FAISS Index type selection
+# Options: "flat" (original), "ivfpq", "ivfsq", "hnsw"
+FAISS_INDEX_TYPE = "ivfpq"  # Change to "ivfpq", "ivfsq", or "hnsw" to use optimized indexes
+
 # LLM configuration
 LLM_URL = "http://localhost:1234/v1/chat/completions"
 LLM_MODEL = "Qwen2.5-14B-Instruct"

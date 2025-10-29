@@ -32,7 +32,7 @@ class LLMClient:
         # OPTIMIZATION: Query rewriting disabled for speed
         # Queries are usually specific enough already, and this adds 0.5+ seconds per request
         # Set to True to re-enable
-        QUERY_REWRITE_ENABLED = False
+        QUERY_REWRITE_ENABLED = True
         
         if not QUERY_REWRITE_ENABLED:
             return query
@@ -45,32 +45,73 @@ class LLMClient:
         
         # Get recent conversation context
         recent_history = conversation_history[-MEMORY_TURNS:]
-        logger.debug(f"   Using last {len(recent_history)} messages from history")
+        logger.info(f"   📖 Found {len(conversation_history)} total messages, using last {len(recent_history)}")
         
         # Create context for query rewriting
         context_parts = []
         for turn in recent_history:
             if turn['role'] == 'user':
-                context_parts.append(f"User: {turn['content']}")
+                context_parts.append(f"User: {turn['content'][:100]}")
             elif turn['role'] == 'assistant':
-                context_parts.append(f"Assistant: {turn['content']}")
+                context_parts.append(f"Assistant: {turn['content'][:100]}")
         
         context = "\n".join(context_parts)
+        logger.info(f"   📝 Context: {context[:200]}")
         
         # Rewrite query to be more specific
-        rewrite_prompt = f"""Based on the conversation history below, rewrite the user's latest query to be more specific and self-contained for Wikipedia search.
+        rewrite_prompt = f"""Task: Rewrite a follow-up question to be complete and specific for Wikipedia search.
 
-Conversation History:
+Previous messages:
 {context}
 
-User's latest query: {query}
+Current question: {query}
 
-Rewritten query (make it specific and searchable):"""
+Write the rewritten question as a single sentence. Nothing else. Just the question."""
 
         try:
             logger.info(f"🔄 Attempting LLM query rewrite...")
             response = self._call_llm(rewrite_prompt, max_tokens=100)
             rewritten = response.strip()
+            
+            # Remove common preamble text that LLMs add
+            # Split by newline and find the first meaningful line
+            lines = rewritten.split('\n')
+            for line in lines:
+                line = line.strip()
+                # Skip empty lines and lines that are just metadata
+                if line and not any(meta in line.lower() for meta in ['question:', 'rewritten', "here's", 'sure,']):
+                    rewritten = line
+                    break
+            
+            # Also handle inline preambles
+            common_prefixes = [
+                "Sure, here's the rewritten",
+                "Here's the rewritten",
+                "The rewritten",
+                "Rewritten:",
+            ]
+            for prefix in common_prefixes:
+                if prefix.lower() in rewritten.lower():
+                    idx = rewritten.lower().find(prefix.lower())
+                    if idx >= 0:
+                        remainder = rewritten[idx + len(prefix):].strip()
+                        remainder = remainder.lstrip('*:- ').strip()
+                        if remainder:
+                            rewritten = remainder
+                            break
+            
+            # Fallback: if LLM returned an error or gave up, just use original
+            error_phrases = [
+                "does not provide",
+                "cannot answer",
+                "no information",
+                "i cannot",
+                "unable to",
+            ]
+            if any(phrase.lower() in rewritten.lower() for phrase in error_phrases):
+                logger.info(f"   ⚠️ LLM got confused, using original query")
+                return query
+            
             logger.info(f"   ✓ Query rewritten to: '{rewritten}'")
             return rewritten
         except Exception as e:
@@ -83,6 +124,11 @@ Rewritten query (make it specific and searchable):"""
         """Generate response using retrieved sources"""
         logger.info(f"📚 Generating response for query: '{query}'")
         logger.info(f"   Using {len(sources)} sources")
+        
+        # Log source summaries for debugging
+        for i, source in enumerate(sources[:3], 1):
+            source_preview = source.get('text', '')[:100].replace('\n', ' ')
+            logger.debug(f"   Source {i} ({source.get('title', 'Unknown')}): {source_preview}...")
         
         # Format sources for the prompt
         sources_text = self._format_sources_for_prompt(sources)

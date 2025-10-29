@@ -11,6 +11,7 @@ import faiss
 import numpy as np
 import pickle
 import time
+import gc
 from pathlib import Path
 from config import FAISS_INDEX_PATH, IDS_MAPPING_PATH
 
@@ -32,36 +33,17 @@ def convert_index(input_index_path, input_ids_path, output_index_path, output_id
         old_id_mapping = pickle.load(f)
     print(f"   ✓ Loaded {len(old_id_mapping):,} ID mappings")
     
-    # Extract vectors from existing index
-    print("🔍 Extracting vectors from existing index...")
-    start_time = time.time()
-    
-    # Get total number of vectors
+    # Get total number of vectors from old index
     n_vectors = old_index.ntotal
     print(f"   Total vectors: {n_vectors:,}")
     
-    # Extract vectors in batches to avoid memory issues
-    batch_size = 10000
-    all_vectors = []
-    
-    for i in range(0, n_vectors, batch_size):
-        end_idx = min(i + batch_size, n_vectors)
-        batch_vectors = old_index.reconstruct_n(i, end_idx - i)
-        all_vectors.append(batch_vectors)
-        
-        if i % 100000 == 0:
-            print(f"   Extracted {i:,}/{n_vectors:,} vectors...")
-    
-    # Combine all vectors
-    vectors = np.vstack(all_vectors).astype('float32')
-    extract_time = time.time() - start_time
-    print(f"   ✓ Extracted {len(vectors):,} vectors in {extract_time:.1f}s")
+    # Get dimension from old index
+    dimension = old_index.d
+    print(f"   Dimension: {dimension}")
     
     # Create new index based on type
-    print(f"🏗️  Creating new {index_type.upper()} index...")
+    print(f"\n🏗️  Creating new {index_type.upper()} index...")
     start_time = time.time()
-    
-    dimension = vectors.shape[1]
     
     if index_type == "ivfpq":
         # Product Quantization - good accuracy, much smaller memory (8-12GB)
@@ -92,37 +74,56 @@ def convert_index(input_index_path, input_ids_path, output_index_path, output_id
     
     # Train the index (required for IVF-based indexes)
     if index_type in ["ivfpq", "ivfsq"]:
-        print("🎓 Training index...")
+        print("\n🎓 Training index on subset of vectors...")
         train_start = time.time()
         
-        # Use a subset for training
-        n_train = min(100000, len(vectors))
-        train_vectors = vectors[:n_train]
+        # Extract only training subset (1M vectors = ~1.5GB)
+        n_train = min(1000000, n_vectors)
+        print(f"   Extracting {n_train:,} vectors for training...")
+        train_vectors = old_index.reconstruct_n(0, n_train)
+        
+        # Normalize for training
         faiss.normalize_L2(train_vectors)
         new_index.train(train_vectors)
+        del train_vectors  # Free immediately
+        gc.collect()
         
         train_time = time.time() - train_start
         print(f"   ✓ Trained on {n_train:,} vectors in {train_time:.1f}s")
     
-    # Add vectors to new index
-    print("➕ Adding vectors to new index...")
+    # Stream vectors from old index to new index in batches
+    print("\n➕ Adding vectors to new index (streaming)...")
     add_start = time.time()
     
-    # Normalize vectors for cosine similarity
-    faiss.normalize_L2(vectors)
-    
-    # Add in batches to avoid memory issues
     batch_size = 50000
-    for i in range(0, len(vectors), batch_size):
-        end_idx = min(i + batch_size, len(vectors))
-        batch = vectors[i:end_idx]
-        new_index.add(batch)
+    for i in range(0, n_vectors, batch_size):
+        end_idx = min(i + batch_size, n_vectors)
+        batch_size_actual = end_idx - i
+        
+        # Extract this batch only
+        batch_vectors = old_index.reconstruct_n(i, batch_size_actual)
+        
+        # Normalize vectors for cosine similarity
+        faiss.normalize_L2(batch_vectors)
+        
+        # Add to new index
+        new_index.add(batch_vectors)
+        
+        # Free batch immediately
+        del batch_vectors
         
         if i % 500000 == 0:
-            print(f"   Added {i:,}/{len(vectors):,} vectors...")
+            print(f"   Added {i:,}/{n_vectors:,} vectors...")
+    
+    # Final gc after all vectors processed
+    gc.collect()
     
     add_time = time.time() - add_start
     print(f"   ✓ Added all vectors in {add_time:.1f}s")
+    
+    # Free old index from memory (file stays on disk)
+    del old_index
+    gc.collect()
     
     # Save new index
     print("💾 Saving new index...")

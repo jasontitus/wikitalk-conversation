@@ -68,7 +68,8 @@ class WikiTalk:
         # Rewrite query based on conversation context
         rewritten_query = self.llm_client.query_rewrite(query, history)
         print(f"Original query: {query}")
-        print(f"Rewritten query: {rewritten_query}")
+        if rewritten_query != query:
+            print(f"Rewritten query: {rewritten_query}")
         
         # Retrieve relevant sources using appropriate search method
         print("Searching Wikipedia...")

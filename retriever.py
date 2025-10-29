@@ -62,14 +62,30 @@ class HybridRetriever:
             logger.info("Using LIKE search only (fast fallback)")
             return
         
-        # Try to load existing FAISS index
-        if FAISS_INDEX_PATH.exists() and not self.build_embeddings:
+        # Try to load existing FAISS index with configured type
+        index_path_to_try = FAISS_INDEX_PATH
+        ids_path_to_try = IDS_MAPPING_PATH
+        
+        # If a specific index type is configured, try that first
+        if FAISS_INDEX_TYPE != "flat":
+            type_specific_index = FAISS_INDEX_PATH.parent / f"faiss_{FAISS_INDEX_TYPE}.index"
+            type_specific_ids = IDS_MAPPING_PATH.parent / f"ids_{FAISS_INDEX_TYPE}.bin"
+            
+            if type_specific_index.exists():
+                index_path_to_try = type_specific_index
+                ids_path_to_try = type_specific_ids
+                logger.info(f"Using {FAISS_INDEX_TYPE.upper()} index: {type_specific_index}")
+            else:
+                logger.warning(f"Index type '{FAISS_INDEX_TYPE}' not found. Falling back to flat index.")
+        
+        if index_path_to_try.exists() and not self.build_embeddings:
             try:
                 logger.info("Loading existing FAISS index...")
-                self.faiss_index = faiss.read_index(str(FAISS_INDEX_PATH))
-                with open(IDS_MAPPING_PATH, 'rb') as f:
+                self.faiss_index = faiss.read_index(str(index_path_to_try))
+                with open(ids_path_to_try, 'rb') as f:
                     self.id_mapping = pickle.load(f)
                 logger.info(f"✓ FAISS index loaded with {len(self.id_mapping)} vectors")
+                logger.info(f"✓ Index type: {type(self.faiss_index).__name__}")
             except Exception as e:
                 logger.warning(f"Failed to load FAISS index: {e}. Will rebuild.")
                 self.build_embeddings = True
