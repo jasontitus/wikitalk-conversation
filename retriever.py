@@ -274,42 +274,53 @@ class HybridRetriever:
             faiss.normalize_L2(query_embedding)
             
             # Search FAISS index
-            scores, indices = self.faiss_index.search(query_embedding, top_k * 3)
+            scores, indices = self.faiss_index.search(query_embedding, top_k * 2)
             
-            results = []
-            cursor = self.conn.cursor()
-            
+            # OPTIMIZATION: Batch database lookups instead of one query per result
+            chunk_ids_with_scores = []
             for score, idx in zip(scores[0], indices[0]):
                 if idx == -1:  # Invalid index
                     continue
                 
                 chunk_id = self.id_mapping.get(idx)
-                if not chunk_id:
-                    continue
-                
-                # Get full metadata
-                cursor.execute("""
-                    SELECT id, text, title, page_id, url, date_modified,
-                           wikidata_id, infoboxes, has_math, start_pos, end_pos
-                    FROM chunks WHERE id = ?
-                """, (chunk_id,))
-                
-                row = cursor.fetchone()
-                if row:
-                    results.append({
-                        'id': row[0],
-                        'text': row[1],
-                        'title': row[2],
-                        'page_id': row[3],
-                        'url': row[4],
-                        'date_modified': row[5],
-                        'wikidata_id': row[6],
-                        'infoboxes': row[7],
-                        'has_math': row[8],
-                        'start_pos': row[9],
-                        'end_pos': row[10],
-                        'score': float(1 / (1 + score))  # Convert distance to similarity
-                    })
+                if chunk_id:
+                    chunk_ids_with_scores.append((chunk_id, score))
+            
+            if not chunk_ids_with_scores:
+                return []
+            
+            # Batch fetch all chunks at once
+            cursor = self.conn.cursor()
+            chunk_ids = [cid for cid, _ in chunk_ids_with_scores]
+            score_map = {cid: score for cid, score in chunk_ids_with_scores}
+            
+            # Use IN clause for batch lookup - much faster than individual queries
+            placeholders = ','.join('?' * len(chunk_ids))
+            cursor.execute(f"""
+                SELECT id, text, title, page_id, url, date_modified,
+                       wikidata_id, infoboxes, has_math, start_pos, end_pos
+                FROM chunks WHERE id IN ({placeholders})
+            """, chunk_ids)
+            
+            rows = cursor.fetchall()
+            results = []
+            
+            for row in rows:
+                chunk_id = row[0]
+                results.append({
+                    'id': row[0],
+                    'text': row[1],
+                    'title': row[2],
+                    'page_id': row[3],
+                    'url': row[4],
+                    'date_modified': row[5],
+                    'wikidata_id': row[6],
+                    'infoboxes': row[7],
+                    'has_math': row[8],
+                    'start_pos': row[9],
+                    'end_pos': row[10],
+                    'score': float(1 / (1 + score_map[chunk_id]))  # Convert distance to similarity
+                })
             
             elapsed = time.time() - start_time
             logger.info(f"Embedding search completed in {elapsed:.2f}s, found {len(results)} results")
@@ -401,7 +412,7 @@ class HybridRetriever:
         else:
             results = self.bm25_search(query, RETRIEVAL_TOPK)
         
-        # Rerank top results
+        # Rerank top results using fuzzy matching for better relevance
         reranked_results = self.rerank_results(query, results, top_k)
         
         elapsed = time.time() - start_time

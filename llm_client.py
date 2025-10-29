@@ -29,6 +29,14 @@ class LLMClient:
         
     def query_rewrite(self, query: str, conversation_history: List[Dict[str, str]]) -> str:
         """Rewrite query based on conversation history"""
+        # OPTIMIZATION: Query rewriting disabled for speed
+        # Queries are usually specific enough already, and this adds 0.5+ seconds per request
+        # Set to True to re-enable
+        QUERY_REWRITE_ENABLED = False
+        
+        if not QUERY_REWRITE_ENABLED:
+            return query
+            
         logger.debug(f"📝 Query rewrite requested for: '{query}'")
         
         if not conversation_history:

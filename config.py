@@ -1,8 +1,9 @@
 """
-WikiTalk Configuration
+Configuration for WikiTalk system
 """
 import os
 from pathlib import Path
+import platform
 
 # Base paths
 BASE_DIR = Path(__file__).parent
@@ -15,12 +16,49 @@ FAISS_INDEX_PATH = DATA_DIR / "faiss.index"
 IDS_MAPPING_PATH = DATA_DIR / "ids.bin"
 CONVERSATIONS_DIR = DATA_DIR / "conversations"
 
-# Model configuration
-EMBEDDING_MODEL = "BAAI/bge-m3"
-EMBEDDING_DIM = 1024  # BGE-M3 embedding dimension
+# Embedding model selection
+# ===========================
+# Choose the embedding model based on your needs and hardware:
+#
+# RECOMMENDED (Fast, Good Quality):
+#   all-MiniLM-L6-v2
+#   - Speed: 1,500-2,000 chunks/sec on Mac GPU
+#   - Build time: ~4-5 hours
+#   - Quality: Excellent for semantic search
+#   - Dimensions: 384
+#   - Best for: Getting started, quick builds
+#
+# HIGH QUALITY (Slower, Best Results):
+#   BAAI/bge-m3
+#   - Speed: 80-100 chunks/sec on Mac GPU
+#   - Build time: ~100-120 hours (one-time, can interrupt/resume)
+#   - Quality: Highest quality embeddings
+#   - Dimensions: 1024
+#   - Best for: Final production when quality is critical
+#
+# BALANCED (Medium Speed/Quality):
+#   all-mpnet-base-v2
+#   - Speed: 800-1,000 chunks/sec on Mac GPU
+#   - Build time: ~9-12 hours
+#   - Quality: Very good
+#   - Dimensions: 768
+#   - Best for: Balance of speed and quality
+
+# ===== SELECT YOUR MODEL HERE =====
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"  # ✅ FAST (default)
+# EMBEDDING_MODEL = "BAAI/bge-m3"  # HIGH QUALITY (slow but best)
+# EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"  # BALANCED
+
+# Set embedding dimension based on model
+if "bge-m3" in EMBEDDING_MODEL:
+    EMBEDDING_DIM = 1024
+elif "mpnet-base" in EMBEDDING_MODEL:
+    EMBEDDING_DIM = 768
+else:
+    EMBEDDING_DIM = 384
 
 # Retrieval configuration
-RETRIEVAL_TOPK = 40
+RETRIEVAL_TOPK = 40  # Restored from 10 for better search quality (FAISS speed not affected by this)
 MEMORY_TURNS = 8
 TEMPERATURE = 0.2
 
@@ -28,17 +66,30 @@ TEMPERATURE = 0.2
 LLM_URL = "http://localhost:1234/v1/chat/completions"
 LLM_MODEL = "Qwen2.5-14B-Instruct"
 
-# TTS configuration - point to home directory voices and piper executable
+# TTS configuration - cross-platform support
 HOME_DIR = Path.home()
+SYSTEM = platform.system()  # 'Windows', 'Darwin' (macOS), 'Linux'
+
+# Piper voice files (same location on all platforms)
 PIPER_VOICE_PATH = HOME_DIR / "piper_voices" / "en_US-amy-low.onnx"
 PIPER_CONFIG_PATH = HOME_DIR / "piper_voices" / "en_US-amy-low.onnx.json"
-PIPER_EXECUTABLE = HOME_DIR / "experiments" / "piper" / "build" / "piper"
+
+# Piper executable path (platform-specific)
+if SYSTEM == "Windows":
+    PIPER_EXECUTABLE = HOME_DIR / "experiments" / "piper" / "build" / "piper.exe"
+elif SYSTEM == "Darwin":  # macOS
+    PIPER_EXECUTABLE = HOME_DIR / "experiments" / "piper" / "build" / "piper"
+else:  # Linux
+    PIPER_EXECUTABLE = HOME_DIR / "experiments" / "piper" / "build" / "piper"
 
 # Add Piper to PATH if it exists
 if PIPER_EXECUTABLE.exists():
     piper_dir = str(PIPER_EXECUTABLE.parent)
     if piper_dir not in os.environ.get('PATH', ''):
-        os.environ['PATH'] = f"{piper_dir}:{os.environ.get('PATH', '')}"
+        if SYSTEM == "Windows":
+            os.environ['PATH'] = f"{piper_dir};{os.environ.get('PATH', '')}"
+        else:
+            os.environ['PATH'] = f"{piper_dir}:{os.environ.get('PATH', '')}"
 
 # Text processing
 CHUNK_SIZE = 1000
