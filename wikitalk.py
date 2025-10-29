@@ -5,6 +5,10 @@ import uuid
 import time
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+import os
+
+# Disable tokenizers parallelism warnings (happens when TTS forks after model load)
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 from retriever import HybridRetriever
 from llm_client import LLMClient, ConversationManager

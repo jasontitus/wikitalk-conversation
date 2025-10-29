@@ -11,6 +11,10 @@ from pathlib import Path
 import time
 from datetime import timedelta
 import psutil
+import os
+
+# Disable tokenizers parallelism warnings (happens when TTS forks after model load)
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 sys.path.insert(0, str(Path(__file__).parent))
 
