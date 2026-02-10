@@ -162,8 +162,8 @@ if PIPER_EXECUTABLE.exists():
 #   "moonshine"      - Moonshine: 61M params, variable-length (no 30s padding), fast (pip install moonshine)
 #   "faster_whisper"  - Faster-Whisper: Whisper accuracy, 4x faster via CTranslate2 (pip install faster-whisper)
 
-STT_ENGINE = "none"
-# STT_ENGINE = "auto"                        # RECOMMENDED: adds voice input
+STT_ENGINE = "auto"                            # Try moonshine first, then faster_whisper, then text
+# STT_ENGINE = "none"                        # TEXT ONLY: disable voice input
 # STT_ENGINE = "moonshine"                   # BEST LATENCY: purpose-built for conversation
 # STT_ENGINE = "faster_whisper"              # BEST ACCURACY: Whisper-level quality
 
