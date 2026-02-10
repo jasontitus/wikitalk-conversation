@@ -160,8 +160,9 @@ class HybridRetriever:
                 for i in range(0, len(chunk_batch), embedding_batch_size):
                     sub_batch = chunk_batch[i:i+embedding_batch_size]
                     
-                    # Create texts for embedding
-                    texts = [f"{row[2]}: {row[1][:500]}" for row in sub_batch]
+                    # Create texts for embedding (with passage prefix if model requires it)
+                    passage_prefix = EMBEDDING_PREFIXES["passage"]
+                    texts = [f"{passage_prefix}{row[2]}: {row[1][:500]}" for row in sub_batch]
                     
                     # Generate embeddings
                     embeddings = self.embedding_model.encode(
@@ -280,12 +281,15 @@ class HybridRetriever:
         if self.faiss_index is None or self.use_bm25_only:
             logger.warning("Embedding search not available, falling back to LIKE search")
             return self.bm25_search(query, top_k)
-        
+
         try:
             start_time = time.time()
-            
+
+            # Apply query prefix if the embedding model requires it (e5, bge, nomic, etc.)
+            query_text = EMBEDDING_PREFIXES["query"] + query
+
             # Generate query embedding
-            query_embedding = self.embedding_model.encode([query], convert_to_numpy=True)
+            query_embedding = self.embedding_model.encode([query_text], convert_to_numpy=True)
             query_embedding = query_embedding.astype('float32')
             faiss.normalize_L2(query_embedding)
             

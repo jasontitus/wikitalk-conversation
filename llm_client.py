@@ -28,12 +28,9 @@ class LLMClient:
         logger.info(f"   Temperature: {self.temperature}")
         
     def query_rewrite(self, query: str, conversation_history: List[Dict[str, str]]) -> str:
-        """Rewrite query based on conversation history"""
-        # OPTIMIZATION: Query rewriting disabled for speed
-        # Queries are usually specific enough already, and this adds 0.5+ seconds per request
-        # Set to True to re-enable
-        QUERY_REWRITE_ENABLED = True
-        
+        """Rewrite query based on conversation history.
+        Controlled by QUERY_REWRITE_ENABLED in config.py.
+        """
         if not QUERY_REWRITE_ENABLED:
             return query
             

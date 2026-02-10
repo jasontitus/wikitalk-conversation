@@ -1,3 +1,4 @@
+# Core dependencies
 pandas>=2.0.0
 fastparquet>=2024.0.0
 faiss-cpu>=1.7.0
@@ -10,3 +11,14 @@ rapidfuzz>=3.0.0
 python-dotenv>=1.0.0
 tqdm>=4.64.0
 psutil>=5.9.0
+
+# Optional: Kokoro TTS (recommended upgrade from Piper)
+# pip install kokoro-onnx soundfile
+# Also download model files from https://huggingface.co/hexgrad/Kokoro-82M :
+#   kokoro-v1.0.onnx, voices-v1.0.bin
+
+# Optional: Moonshine STT (recommended for voice input)
+# pip install moonshine sounddevice
+
+# Optional: Faster-Whisper STT (alternative voice input, best accuracy)
+# pip install faster-whisper sounddevice

@@ -13,13 +13,14 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 from retriever import HybridRetriever
 from llm_client import LLMClient, ConversationManager
 from tts_client import TTSClient
+from stt_client import STTClient
 from config import *
 
 
 class WikiTalk:
     def __init__(self, use_embeddings=True):
         """Initialize WikiTalk
-        
+
         Args:
             use_embeddings: If True, use semantic search; if False, use keyword search
         """
@@ -27,6 +28,7 @@ class WikiTalk:
         self.retriever = HybridRetriever(use_bm25_only=not use_embeddings)
         self.llm_client = LLMClient()
         self.tts_client = TTSClient()
+        self.stt_client = STTClient()
         self.conversation_manager = ConversationManager()
         self.session_id = str(uuid.uuid4())
         self.use_embeddings = use_embeddings
@@ -48,12 +50,17 @@ class WikiTalk:
         try:
             tts_available = self.tts_client.test_tts()
             if tts_available:
-                print("✓ TTS system ready")
+                print(f"TTS system ready (engine: {self.tts_client.tts_method})")
             else:
-                print("⚠ TTS system not available, will use text-only mode")
+                print("TTS system not available, will use text-only mode")
         except Exception as e:
-            print(f"⚠ TTS system error: {e}")
-        
+            print(f"TTS system error: {e}")
+
+        if self.stt_client.is_available:
+            print(f"STT system ready (engine: {self.stt_client.engine})")
+        else:
+            print("STT not available, using keyboard input (set STT_ENGINE in config.py to enable)")
+
         print("WikiTalk initialized successfully!")
         return True
     
@@ -117,51 +124,68 @@ class WikiTalk:
         self.session_id = str(uuid.uuid4())
         print(f"New conversation started: {self.session_id}")
     
+    def _get_input(self) -> Optional[str]:
+        """Get user input via STT (if available) or keyboard."""
+        if self.stt_client.is_available:
+            print("\nYou (speak or type, Enter to use mic): ", end="", flush=True)
+            # Let user type; if they just press Enter, use microphone
+            typed = input().strip()
+            if typed:
+                return typed
+            # Empty Enter → record from mic
+            text = self.stt_client.listen()
+            if text:
+                print(f"  Heard: \"{text}\"")
+                return text
+            print("  (no speech detected, try again)")
+            return None
+        else:
+            return input("\nYou: ").strip() or None
+
     def interactive_mode(self):
         """Run interactive chat mode"""
         print("\n" + "="*60)
-        print("🤖 WikiTalk - Local Conversational Historian")
+        print("WikiTalk - Local Conversational Historian")
         print("="*60)
         print("Ask me anything about history, science, or culture!")
+        if self.stt_client.is_available:
+            print("Press Enter to speak, or type your question directly.")
         print("Type 'quit' to exit, 'clear' to start new conversation")
         print("="*60)
-        
+
         while True:
             try:
-                query = input("\n👤 You: ").strip()
-                
+                query = self._get_input()
+
+                if query is None:
+                    continue
+
                 if query.lower() in ['quit', 'exit', 'q']:
-                    print("👋 Goodbye!")
+                    print("Goodbye!")
                     break
-                
+
                 if query.lower() in ['clear', 'new']:
                     self.clear_conversation()
                     continue
-                
-                if not query:
-                    continue
-                
-                print("\n🤖 WikiTalk: ", end="", flush=True)
-                
-                # Process query
+
+                print("\nWikiTalk: ", end="", flush=True)
+
                 result = self.process_query(query, use_tts=True)
-                
-                # Display response
+
                 print(result["response"])
-                
-                # Show sources
+
                 if result["sources"]:
-                    print(f"\n📚 Sources:")
+                    print(f"\nSources:")
                     for i, source in enumerate(result["sources"], 1):
                         print(f"  {i}. {source['title']}")
-                
-                print(f"\n⏱️  Processed in {result['processing_time']:.2f}s")
-                
+
+                print(f"\nProcessed in {result['processing_time']:.2f}s")
+
             except KeyboardInterrupt:
-                print("\n👋 Goodbye!")
+                print("\nGoodbye!")
                 break
             except Exception as e:
-                print(f"\n❌ Error: {e}")
+                print(f"\nError: {e}")
                 continue
     
     def close(self):
